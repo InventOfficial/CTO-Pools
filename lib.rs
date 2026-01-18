@@ -246,6 +246,8 @@ pub mod cto_pools {
     }
 
     /// Create a proposal to request sending SOL from the pool to a destination.
+    /// SECURITY: Single donors cannot create proposals (they cannot meet 30% quorum with 20% voting cap)
+    /// Single donors should withdraw their funds directly instead.
     pub fn create_proposal(
         ctx: Context<CreateProposal>,
         kind: ProposalKind,
@@ -261,6 +263,17 @@ pub mod cto_pools {
         require!(donor.shares > 0, CtoError::NoShares);
 
         let proposer_wallet = ctx.accounts.proposer_wallet.key();
+
+        // SECURITY FIX: Prevent single donors from creating proposals
+        // With a single donor, their voting power is capped at 20% of total shares,
+        // but quorum requires 30% participation. This means a single donor can NEVER
+        // pass a proposal. Instead, they should withdraw funds directly.
+        // A donor is "single" if they own 100% of shares (their shares == total_shares)
+        require!(
+            pool.total_shares != donor.shares,
+            CtoError::SingleDonorCannotPropose
+        );
+        msg!("✓ Pool has multiple donors - proposal creation allowed");
 
         // proposer value in lamports - use u128 to prevent overflow
         let donor_value = {
@@ -492,14 +505,49 @@ pub mod cto_pools {
         // Fail path: quorum or majority not met
         if !(quorum_met && majority_met) {
             let requested_amount = ctx.accounts.proposal.requested_amount;
-            let (_fee, total_out) = compute_payout(requested_amount, ctx.accounts.pool.protocol_fee_bps)?;
-            // unlock reserved lamports
+            let (fee, total_out) = compute_payout(requested_amount, ctx.accounts.pool.protocol_fee_bps)?;
+            
+            // Log detailed failure information for debugging
+            msg!("❌ Proposal FAILED - unlocking funds");
+            msg!("   Quorum met: {}, Majority met: {}", quorum_met, majority_met);
+            msg!("   Participation: {} / {} (quorum requires {})",
+                ctx.accounts.proposal.participation_weight,
+                ctx.accounts.proposal.total_snapshot_shares,
+                ctx.accounts.pool.quorum_bps
+            );
+            msg!("   Votes - Yes: {}, No: {}, Abstain: {}",
+                ctx.accounts.proposal.yes_weight,
+                ctx.accounts.proposal.no_weight,
+                ctx.accounts.proposal.abstain_weight
+            );
+            msg!("   Unlocking {} lamports (requested: {}, fee: {})", total_out, requested_amount, fee);
+            msg!("   Reserved before: {} lamports", ctx.accounts.pool.reserved_lamports);
+            
+            // unlock reserved lamports - THIS IS CRITICAL FOR WITHDRAWALS
             ctx.accounts.pool.reserved_lamports = ctx.accounts.pool
                 .reserved_lamports
                 .checked_sub(total_out)
                 .ok_or(CtoError::MathOverflow)?;
+            
+            msg!("   Reserved after: {} lamports", ctx.accounts.pool.reserved_lamports);
+            msg!("   Pool total_sol: {} lamports", ctx.accounts.pool.total_sol_in_pool);
+            msg!("   Free liquidity: {} lamports",
+                ctx.accounts.pool.total_sol_in_pool.saturating_sub(ctx.accounts.pool.reserved_lamports)
+            );
+            
             ctx.accounts.proposal.status = ProposalStatus::Failed;
             ctx.accounts.pool.active_proposal = None;
+            
+            // Emit event for frontend tracking
+            emit!(ProposalFailedEvent {
+                pool: ctx.accounts.pool.key(),
+                proposal: ctx.accounts.proposal.key(),
+                unlocked_lamports: total_out,
+                quorum_met,
+                majority_met,
+                timestamp: clock.unix_timestamp,
+            });
+            
             return Ok(());
         }
 
@@ -867,8 +915,7 @@ pub struct CreatePool<'info> {
         bump
     )]
     pub pool: Account<'info, Pool>,
-    /// CHECK: we only store the key
-    pub token_mint: UncheckedAccount<'info>,
+    pub token_mint: Account<'info, Mint>,
     #[account(mut)]
     pub creator: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -1273,6 +1320,18 @@ pub struct SwapFailureEvent {
     pub timestamp: i64,
 }
 
+/// Event emitted when a proposal fails (quorum or majority not met)
+/// Used for frontend tracking and debugging fund unlock issues
+#[event]
+pub struct ProposalFailedEvent {
+    pub pool: Pubkey,
+    pub proposal: Pubkey,
+    pub unlocked_lamports: u64,
+    pub quorum_met: bool,
+    pub majority_met: bool,
+    pub timestamp: i64,
+}
+
 // ---------- Errors ----------
 
 #[error_code]
@@ -1309,4 +1368,6 @@ pub enum CtoError {
     NoTokensToburn,
     #[msg("Raydium pool not configured")]
     RaydiumNotConfigured,
+    #[msg("Single donor cannot create proposals - withdraw funds directly instead. With 20% voting cap and 30% quorum, a single donor can never pass a proposal.")]
+    SingleDonorCannotPropose,
 }
