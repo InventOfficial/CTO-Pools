@@ -1,0 +1,25 @@
+[package]
+name = "cto_pools"
+version = "0.1.3"
+description = "Decentralized Community Takeover (CTO) Funding System for Abandoned Tokens"
+edition = "2021"
+license = "MIT"
+homepage = "https://github.com/InventOfficial/CTO-Pools"
+repository = "https://github.com/InventOfficial/CTO-Pools"
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "cto_pools"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed", "event-cpi"] }
+anchor-spl = "0.31.1"
