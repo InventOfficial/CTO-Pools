@@ -47,8 +47,9 @@
 - **Automatic Yield**: All funds earn staking rewards through jitoSOL
 
 ### 🗳️ Governance System
+- **Voting Weights Based on Shares**: Voting power proportional to share ownership
+- **20% Voting Weight Cap**: Prevents whale domination of governance
 - **30% Quorum Requirement**: Ensures meaningful community participation
-- **20% Voting Cap**: Prevents whale domination of governance
 - **24-Hour Voting Period**: Balanced timeframe for participation
 - **Single Active Proposal**: Prevents governance spam
 
@@ -66,6 +67,8 @@
 - **Holding Delay**: Non-creators must wait before proposing
 - **Stake Pool Validation**: Only allows verified Jito stake pools
 - **Fund Recovery Governance**: Democratic process to recover accidentally sent tokens
+- **Proposals Lock Funds**: Same percentage of LST locked per donor during proposals
+- **Withdraw Your Funds Anytime**: Donors can withdraw their unlocked SOL at any time
 
 ---
 
@@ -425,9 +428,9 @@ RecoveryNotAllowedForLST  // Cannot recover pool's backing LST
 
 | Network | Version | Program ID |
 |---------|---------|------------|
-| **Mainnet** | V2 (Current) | `4T9SkpDeDyC8KWKrcGsVQ6wG14H46og6f9pBFNc1Csje` |
-| **Mainnet** | V1 (Deprecated) | `GEZjJhN2DFWBaRMoTYM8JRKdyMYyMjYsG4Ag5LyEMJ2` |
-| **Devnet** | V2 | Use Anchor deploy with devnet config |
+| **Devnet** | V2 (Current) | `4T9SkpDeDyC8KWKrcGsVQ6wG14H46og6f9pBFNc1Csje` |
+| **Devnet** | V1 (Deprecated) | `GEZjJhN2DFWBaRMoTYM8JRKdyMYyMjYsG4Ag5LyEMJ2` |
+| **Mainnet** | V2 | Use Anchor deploy with mainnet config |
 
 ### Version Differences
 
