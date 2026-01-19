@@ -381,11 +381,11 @@ JITO_DEVNET_JITOSOL_MINT: J1tos8mqbhdGcF3pgj4PCKyVjzWSURcpLZU7pPGHxSYi
 
 | Measure | Description |
 |---------|-------------|
-| **Single Donor Prevention** | If `total_shares == donor.shares`, the donor cannot create proposals. This prevents a single contributor from self-dealing. |
-| **Holding Delay** | Non-creator donors must wait `MIN_PROPOSAL_DELAY_SLOTS` after their last share change before proposing. |
+| **Single Donor Prevention** | If `total_shares == donor.shares`, the donor cannot create proposals. This prevents a single contributor from locking their funds. 20% voting weight does not meet the 30% quorum to pass a proposal. It's better to just withdraw. |
+| **Holding Delay** | Non-creator donors must wait `MIN_PROPOSAL_DELAY_SLOTS` after meeting the 1 SOL minimum deposit before proposing. This ensures donor dedication and prevents malicious rapid proposal creation, locking a communities funds. |
 | **Voting Cap** | Maximum 20% voting weight per wallet, regardless of actual share ownership. |
 | **Single Active Proposal** | Only one proposal can be active at a time per pool. |
-| **LST Recovery Prevention** | The pool's backing LST (jitoSOL) cannot be recovered through the recovery mechanism. |
+| **LST Recovery Prevention** | The pool's backing LST (jitoSOL) cannot be recovered through the recovery mechanism to avoid draining the pool's liquidity (Use a Governance Proposal, or Withdraw instead). The recovery mechanism is a safeguard to recover funds that should not be in the pool. |
 
 ### Stake Pool Validation
 
