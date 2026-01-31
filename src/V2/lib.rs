@@ -1,16 +1,17 @@
-// ---------- CTO Pools Program V3.1 ----------
+// ---------- CTO Pools Program V2 ----------
 
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::{
-    instruction::{AccountMeta, Instruction},
-    program::{invoke, invoke_signed},
-    system_instruction,
-};
+use anchor_lang::solana_program::{program::invoke, program::invoke_signed, system_instruction};
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount};
+// Note: BorshDeserialize is imported via anchor_lang::prelude::*
+// We use spl_stake_pool's built-in deserialization to avoid version conflicts
 
 // SPL Stake Pool (used for SOL<->LST)
-use spl_stake_pool::{instruction as stake_pool_ix, state::StakePool};
+use spl_stake_pool::{
+    instruction as stake_pool_ix,
+    state::StakePool,
+};
 
 declare_id!("4T9SkpDeDyC8KWKrcGsVQ6wG14H46og6f9pBFNc1Csje");
 
@@ -29,76 +30,26 @@ const MAX_VOTER_BPS: u16 = 2000;
 const PROPOSAL_BUFFER_BPS: u64 = 50;
 
 /// NOTE: restore to ~216_000 for production (~1 day)
-const MIN_PROPOSAL_DELAY_SLOTS: u64 = 18_000; // ~2 hours at ~400ms/slot
+const MIN_PROPOSAL_DELAY_SLOTS: u64 = 0;
 
-/// Minimum delay before an abort vote is eligible (~2 hours at ~400ms/slot)
-const MIN_ABORTER_DELAY_SLOTS: u64 = 18_000;
-
-/// Minimum time after proposal creation before abort can be finalized (4 hours)
-const MIN_ABORT_REVIEW_SECONDS: i64 = 4 * 60 * 60;
-
-/// Cooldown period after an abort before new proposals can be created (6 hours)
-const COOLDOWN_AFTER_ABORT_SECONDS: i64 = 6 * 60 * 60;
-
-/// Minimum time after proposal creation before execution is allowed (4 hours)
-const MIN_EXECUTE_DELAY_SECONDS: i64 = 4 * 60 * 60;
-
-// Buy & burn slippage tolerance (bps). Larger means more tolerant (less likely to fail), but weaker price protection.
+// Raydium (CTOP buy & burn) constants
 const MAX_SLIPPAGE_BPS: u64 = 1500; // 15%
-
-// Estimated PumpSwap LP/protocol fee (bps). Used only for min-out modeling to reduce false failures.
-// Keep conservative while upgrade authority is retained.
-const PUMPSWAP_FEE_BPS_ESTIMATE: u64 = 50; // 0.50%
-
-// Legacy Raydium swap constants (kept optional)
 const RAYDIUM_SWAP_INSTRUCTION: u8 = 9;
-
-/// BPS denominator
-const BPS_DENOM: u64 = 10_000;
 
 pub const INCINERATOR: Pubkey = pubkey!("1nc1nerator11111111111111111111111111111111");
 pub const WSOL_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
 
-/// PumpSwap program id (used after Pump.fun graduation).
-/// IMPORTANT: Treat this as a protocol dependency. Keep upgrade authority during beta to respond to upstream changes.
-pub const PUMPSWAP_PROGRAM_ID: Pubkey = pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
-
-/// PumpSwap `buy` discriminator (Anchor-style 8-byte discriminator).
-/// Args: (base_amount_out: u64, max_quote_amount_in: u64)
-///
-/// NOTE: This discriminator must match the PumpSwap program's IDL.
-/// If PumpSwap updates, this may change; keep upgrade authority until stable.
-const PUMPSWAP_BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
-
 // Jito Stake Pool references
-pub const JITO_MAINNET_STAKE_POOL_PROGRAM: Pubkey =
-    pubkey!("SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy");
-
-// Jito mainnet/testnet stake pool + jitoSOL mint (per Jito docs)
-pub const JITO_MAINNET_STAKE_POOL: Pubkey = pubkey!("Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb");
-pub const JITO_MAINNET_JITOSOL_MINT: Pubkey =
-    pubkey!("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn");
-pub const JITO_DEVNET_STAKE_POOL_PROGRAM: Pubkey =
-    pubkey!("DPoo15wWDqpPJJtS2MUZ49aRxqz5ZaaJCJP4z8bLuib");
+// Mainnet jitoSOL (mint is stable, but you can override per-pool config)
+pub const JITO_MAINNET_STAKE_POOL_PROGRAM: Pubkey = pubkey!("SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy");
+// Devnet up-to-date deployment (per Jito docs)
+pub const JITO_DEVNET_STAKE_POOL_PROGRAM: Pubkey = pubkey!("DPoo15wWDqpPJJtS2MUZ49aRxqz5ZaaJCJP4z8bLuib");
 pub const JITO_DEVNET_STAKE_POOL: Pubkey = pubkey!("JitoY5pcAxWX6iyP2QdFwTznGb8A99PRCUCVVxB46WZ");
-pub const JITO_DEVNET_JITOSOL_MINT: Pubkey =
-    pubkey!("J1tos8mqbhdGcF3pgj4PCKyVjzWSURcpLZU7pPGHxSYi");
-
-// ============= Constants for Security Fixes =============
-
-/// H-05 FIX: PumpSwap version tracking
-const PUMPSWAP_EXPECTED_VERSION: u8 = 1;
-
-/// Proposal duration: 24 hours
-const PROPOSAL_DURATION_SECONDS: i64 = 24 * 60 * 60;
-
-/// Strike reset threshold: 3 successful participations
-const STRIKE_RESET_THRESHOLD: u16 = 3;
-
-/// Minimum abort voters required
-const MIN_ABORT_VOTERS: u8 = 2;
+pub const JITO_DEVNET_JITOSOL_MINT: Pubkey = pubkey!("J1tos8mqbhdGcF3pgj4PCKyVjzWSURcpLZU7pPGHxSYi");
 
 // ============= Macros =============
+// NOTE: Macros must be defined BEFORE they are used in Rust.
+// This macro generates the PDA seeds for pool-signed CPIs.
 
 /// Generates PDA seeds for pool-signed operations.
 /// Usage: pool_seeds!(pool_account, bump_value)
@@ -106,21 +57,6 @@ const MIN_ABORT_VOTERS: u8 = 2;
 macro_rules! pool_seeds {
     ($pool:expr, $bump:expr) => {
         &[&[b"pool", $pool.token_mint.as_ref(), &[$bump]]]
-    };
-}
-
-/// H-04 FIX: Reentrancy guard macros for CPI safety
-/// Locks the pool to prevent reentrant calls during CPIs
-macro_rules! lock_pool {
-    ($pool:expr) => {
-        require!(!$pool.locked, CtoError::ReentrancyDetected);
-        $pool.locked = true;
-    };
-}
-
-macro_rules! unlock_pool {
-    ($pool:expr) => {
-        $pool.locked = false;
     };
 }
 
@@ -145,122 +81,44 @@ pub mod cto_pools {
         validate_stake_pool_config(stake_pool_program, stake_pool, lst_mint)?;
 
         let pool = &mut ctx.accounts.pool;
-
-        // Identity / ownership
         pool.token_mint = ctx.accounts.token_mint.key();
         pool.authority = ctx.accounts.creator.key();
         pool.creator = ctx.accounts.creator.key();
 
-        // Accounting
         pool.total_shares = 0;
         pool.total_pool_tokens = 0; // will be set from on-chain balance after first deposit
         pool.reserved_pool_tokens = 0;
         pool.total_spent_lamports = 0;
 
-        // Governance/config
         pool.protocol_fee_bps = PROTOCOL_FEE_BPS;
         pool.quorum_bps = QUORUM_BPS;
         pool.min_proposer_deposit_lamports = MIN_PROPOSER_DEPOSIT_LAMPORTS;
 
-        // Fee outputs
         pool.dev_fee_wallet = dev_fee_wallet;
         pool.burn_token_mint = burn_token_mint;
 
-        // Proposal tracking
         pool.active_proposal = None;
         pool.proposal_count = 0;
-
-        // Abort governance controls
-        pool.proposal_cooldown_until_ts = 0;
-        pool.base_penalty_lamports = 100_000_000; // 0.1 SOL base penalty
-
-        // Recovery tracking
-        pool.active_recovery = None;
-        pool.recovery_count = 0;
 
         // LST config
         pool.stake_pool_program = stake_pool_program;
         pool.stake_pool = stake_pool;
         pool.lst_mint = lst_mint;
 
-        // PumpSwap buy&burn config (post Pump.fun graduation)
-        pool.pumpswap_enabled = false;
-        pool.pumpswap_pool_id = Pubkey::default();
-        pool.pumpswap_base_vault = Pubkey::default();
-        pool.pumpswap_quote_vault = Pubkey::default();
-        pool.pumpswap_global_config = Pubkey::default();
-        pool.pumpswap_fee_recipient = Pubkey::default();
-        pool.pumpswap_version = PUMPSWAP_EXPECTED_VERSION; // H-05 FIX: Track PumpSwap version
-
-        // Legacy Raydium buy&burn config (optional)
+        // Raydium buy&burn config (optional)
         pool.raydium_enabled = false;
         pool.raydium_pool_id = Pubkey::default();
-        
-        // H-04 FIX: Initialize reentrancy lock
-        pool.locked = false;
-
-        // L-05 FIX: Emit pool creation event
-        let clock = Clock::get()?;
-        emit!(PoolCreatedEvent {
-            pool: pool.key(),
-            token_mint: ctx.accounts.token_mint.key(),
-            authority: ctx.accounts.creator.key(),
-            timestamp: clock.unix_timestamp,
-        });
 
         Ok(())
     }
 
-    /// Configure PumpSwap pool for buy & burn (post Pump.fun graduation).
-    ///
-    /// Security model:
-    /// - The pool stores **all critical PumpSwap addresses** in the Pool account (pool id + vaults + config + fee recipient).
-    /// - Any executor may call `execute_proposal`, but they cannot redirect the swap output:
-    ///   - Output is forced into PDA-owned token accounts (`pool_ctop_account`), then burned to the incinerator ATA.
-    /// - On execution, the program checks that the passed accounts match the stored config, preventing
-    ///   malicious "account injection" attacks.
-    pub fn configure_pumpswap_pool(
-        ctx: Context<ConfigurePumpSwapPool>,
-        pumpswap_pool_id: Pubkey,
-        base_vault: Pubkey,
-        quote_vault: Pubkey,
-        global_config: Pubkey,
-        fee_recipient: Pubkey,
-        enabled: bool,
-    ) -> Result<()> {
-        require!(
-            ctx.accounts.authority.key() == ctx.accounts.pool.authority,
-            CtoError::UnauthorizedAuthority
-        );
-
-        // Conservative safety checks to avoid partially-configured pools.
-        require!(pumpswap_pool_id != Pubkey::default(), CtoError::InvalidPumpSwapConfig);
-        require!(base_vault != Pubkey::default(), CtoError::InvalidPumpSwapConfig);
-        require!(quote_vault != Pubkey::default(), CtoError::InvalidPumpSwapConfig);
-        require!(global_config != Pubkey::default(), CtoError::InvalidPumpSwapConfig);
-        require!(fee_recipient != Pubkey::default(), CtoError::InvalidPumpSwapConfig);
-
-        let pool = &mut ctx.accounts.pool;
-        pool.pumpswap_pool_id = pumpswap_pool_id;
-        pool.pumpswap_base_vault = base_vault;
-        pool.pumpswap_quote_vault = quote_vault;
-        pool.pumpswap_global_config = global_config;
-        pool.pumpswap_fee_recipient = fee_recipient;
-        pool.pumpswap_enabled = enabled;
-
-        Ok(())
-    }
-
-    /// Configure Raydium pool for buy & burn (legacy / optional).
+    /// Configure Raydium pool for buy & burn.
     pub fn configure_raydium_pool(
         ctx: Context<ConfigureRaydiumPool>,
         raydium_pool_id: Pubkey,
         enabled: bool,
     ) -> Result<()> {
-        require!(
-            ctx.accounts.authority.key() == ctx.accounts.pool.authority,
-            CtoError::UnauthorizedAuthority
-        );
+        require!(ctx.accounts.authority.key() == ctx.accounts.pool.authority, CtoError::UnauthorizedAuthority);
         ctx.accounts.pool.raydium_pool_id = raydium_pool_id;
         ctx.accounts.pool.raydium_enabled = enabled;
         Ok(())
@@ -269,29 +127,28 @@ pub mod cto_pools {
     /// Donate native SOL to the pool.
     ///
     /// Flow:
-    /// - CPI into the configured stake-pool program `deposit_sol_with_slippage`
+    /// - CPI into the configured stake-pool program `DepositSolWithSlippage`
     /// - pool receives LST tokens (e.g. jitoSOL) into its token account
     /// - shares minted to donor based on LST received
     pub fn donate_sol(ctx: Context<DonateSol>, lamports_in: u64, minimum_pool_tokens_out: u64) -> Result<()> {
         require!(lamports_in > 0, CtoError::ZeroAmount);
 
-        // H-04 FIX: Reentrancy guard - lock before CPI
-        lock_pool!(ctx.accounts.pool);
+        // CPI: stake-pool deposit SOL -> pool gets LST
+        stake_pool_deposit_sol(
+            &ctx,
+            lamports_in,
+            minimum_pool_tokens_out,
+        )?;
 
-        // Defensive accounting: read pre-CPI balance from the token account itself.
-        ctx.accounts.pool_lst_account.reload()?;
-        let pre_balance = ctx.accounts.pool_lst_account.amount;
-
-        stake_pool_deposit_sol(&ctx, lamports_in, minimum_pool_tokens_out)?;
-
-        // Observe actual received LST and update accounting.
+        // Reload pool LST account to get actual received
         let pool = &mut ctx.accounts.pool;
-        // Keep state aligned with observed pre balance (handles external top-ups as shared donations).
-        pool.total_pool_tokens = pre_balance;
         ctx.accounts.pool_lst_account.reload()?;
         let new_balance = ctx.accounts.pool_lst_account.amount;
 
-        let prev_total = pre_balance;
+        // Calculate received LST by diff from tracked total (best-effort) or from pre-balance
+        // For correctness against drift, we treat `pool.total_pool_tokens` as an accounting hint and
+        // then set it to the observed balance.
+        let prev_total = pool.total_pool_tokens;
         let received = new_balance.checked_sub(prev_total).ok_or(CtoError::MathOverflow)?;
         require!(received > 0, CtoError::StakePoolReturnedZero);
 
@@ -299,64 +156,41 @@ pub mod cto_pools {
         let shares_minted = if pool.total_shares == 0 {
             received
         } else {
+            // shares = received * total_shares / total_pool_tokens
             let r = (received as u128)
-                .checked_mul(pool.total_shares as u128)
-                .ok_or(CtoError::MathOverflow)?
-                .checked_div(prev_total as u128)
-                .ok_or(CtoError::MathOverflow)?;
+                .checked_mul(pool.total_shares as u128).ok_or(CtoError::MathOverflow)?
+                .checked_div(prev_total as u128).ok_or(CtoError::MathOverflow)?;
             u64::try_from(r).map_err(|_| CtoError::MathOverflow)?
         };
         require!(shares_minted > 0, CtoError::StakePoolReturnedZero);
 
         // Update pool
         pool.total_pool_tokens = new_balance;
-        pool.total_shares = pool
-            .total_shares
-            .checked_add(shares_minted)
-            .ok_or(CtoError::MathOverflow)?;
+        pool.total_shares = pool.total_shares.checked_add(shares_minted).ok_or(CtoError::MathOverflow)?;
 
         // Update donor
         let donor = &mut ctx.accounts.donor;
         let clock = Clock::get()?;
         donor.pool = pool.key();
         donor.wallet = ctx.accounts.donor_wallet.key();
-        donor.shares = donor
-            .shares
-            .checked_add(shares_minted)
-            .ok_or(CtoError::MathOverflow)?;
-        donor.total_deposited_lamports = donor
-            .total_deposited_lamports
-            .checked_add(lamports_in)
-            .ok_or(CtoError::MathOverflow)?;
+        donor.shares = donor.shares.checked_add(shares_minted).ok_or(CtoError::MathOverflow)?;
+        donor.total_deposited_lamports = donor.total_deposited_lamports.checked_add(lamports_in).ok_or(CtoError::MathOverflow)?;
         donor.last_shares_change_slot = clock.slot;
-
-        // H-04 FIX: Unlock after successful operation
-        unlock_pool!(ctx.accounts.pool);
-
-        // L-05 FIX: Emit donation event
-        emit!(DonationEvent {
-            pool: ctx.accounts.pool.key(),
-            donor: ctx.accounts.donor_wallet.key(),
-            lamports_in,
-            shares_minted,
-            timestamp: clock.unix_timestamp,
-        });
 
         Ok(())
     }
 
     /// Withdraw X SOL worth of stake from the pool.
     ///
-    /// Notes:
-    /// - Uses a stake-pool CPI withdraw (burn LST, receive SOL into pool PDA).
-    /// - Then immediately transfers the SOL out to the donor.
+    /// - user specifies `lamports_out_desired`
+    /// - program computes minimum pool-tokens to burn (ceil) so that the stake-pool withdraw
+    ///   returns at least that many lamports (best-effort; fees/slippage handled by stake-pool)
+    /// - burns donor shares proportional to burned pool tokens
     pub fn withdraw_sol(ctx: Context<WithdrawSol>, lamports_out_desired: u64, minimum_lamports_out: u64) -> Result<()> {
         require!(lamports_out_desired > 0, CtoError::ZeroAmount);
 
-        // H-04 FIX: Reentrancy guard - lock before CPI
-        lock_pool!(ctx.accounts.pool);
-
         // ============ PHASE 1: Immutable reads and calculations ============
+        // Read all values we need BEFORE any mutable borrows
         let donor_shares = ctx.accounts.donor.shares;
         let total_shares = ctx.accounts.pool.total_shares;
         let reserved_pool_tokens = ctx.accounts.pool.reserved_pool_tokens;
@@ -366,6 +200,7 @@ pub mod cto_pools {
         require!(donor_shares > 0, CtoError::NoShares);
         require!(total_shares > 0, CtoError::MathOverflow);
 
+        // Observe current balances
         ctx.accounts.pool_lst_account.reload()?;
         let total_pool_tokens_observed = ctx.accounts.pool_lst_account.amount;
 
@@ -373,35 +208,38 @@ pub mod cto_pools {
             .checked_sub(reserved_pool_tokens)
             .ok_or(CtoError::MathOverflow)?;
 
+        // donor's max withdrawable from free side
         let donor_free_pool_tokens = ((donor_shares as u128)
-            .checked_mul(free_pool_tokens as u128)
-            .ok_or(CtoError::MathOverflow)?)
-            .checked_div(total_shares as u128)
-            .ok_or(CtoError::MathOverflow)?;
+            .checked_mul(free_pool_tokens as u128).ok_or(CtoError::MathOverflow)?)
+            .checked_div(total_shares as u128).ok_or(CtoError::MathOverflow)?;
         let donor_free_pool_tokens = u64::try_from(donor_free_pool_tokens).map_err(|_| CtoError::MathOverflow)?;
 
+        // Convert desired lamports to pool tokens to burn
         let stake_pool_state = read_stake_pool(&ctx.accounts.stake_pool)?;
         let pool_tokens_to_burn = pool_tokens_for_lamports_ceil(&stake_pool_state, lamports_out_desired)?;
         require!(pool_tokens_to_burn > 0, CtoError::ZeroAmount);
         require!(pool_tokens_to_burn <= donor_free_pool_tokens, CtoError::InsufficientWithdrawable);
 
+        // Burn shares proportional to pool tokens burned
         let shares_to_burn = ((pool_tokens_to_burn as u128)
-            .checked_mul(total_shares as u128)
-            .ok_or(CtoError::MathOverflow)?)
-            .checked_div(total_pool_tokens_observed as u128)
-            .ok_or(CtoError::MathOverflow)?;
+            .checked_mul(total_shares as u128).ok_or(CtoError::MathOverflow)?)
+            .checked_div(total_pool_tokens_observed as u128).ok_or(CtoError::MathOverflow)?;
         let shares_to_burn = u64::try_from(shares_to_burn).map_err(|_| CtoError::MathOverflow)?;
         require!(shares_to_burn > 0 && shares_to_burn <= donor_shares, CtoError::MathOverflow);
 
-        // ============ PHASE 2: CPIs ============
+        // ============ PHASE 2: CPIs (no mutable account data borrows) ============
+        // CPI withdraw: burns pool tokens from pool's LST account and returns SOL to pool PDA
         let pre_pool_lamports = ctx.accounts.pool.to_account_info().lamports();
-        stake_pool_withdraw_sol(&ctx, pool_tokens_to_burn, minimum_lamports_out)?;
+        stake_pool_withdraw_sol(
+            &ctx,
+            pool_tokens_to_burn,
+            minimum_lamports_out,
+        )?;
         let post_pool_lamports = ctx.accounts.pool.to_account_info().lamports();
-        let received = post_pool_lamports
-            .checked_sub(pre_pool_lamports)
-            .ok_or(CtoError::MathOverflow)?;
+        let received = post_pool_lamports.checked_sub(pre_pool_lamports).ok_or(CtoError::MathOverflow)?;
         require!(received >= minimum_lamports_out, CtoError::SlippageExceeded);
 
+        // Transfer all received SOL to donor
         transfer_lamports_signed(
             &ctx.accounts.pool.to_account_info(),
             &ctx.accounts.donor_wallet.to_account_info(),
@@ -409,43 +247,31 @@ pub mod cto_pools {
             received,
         )?;
 
+        // Reload after all CPIs
         ctx.accounts.pool_lst_account.reload()?;
         let final_pool_tokens = ctx.accounts.pool_lst_account.amount;
         let clock = Clock::get()?;
-        // ============ PHASE 3: state updates ============
+
+        // ============ PHASE 3: Mutable state updates (scoped) ============
         {
             let pool = &mut ctx.accounts.pool;
             pool.total_pool_tokens = final_pool_tokens;
-            pool.total_shares = pool
-                .total_shares
-                .checked_sub(shares_to_burn)
-                .ok_or(CtoError::MathOverflow)?;
+            pool.total_shares = pool.total_shares.checked_sub(shares_to_burn).ok_or(CtoError::MathOverflow)?;
         }
         {
             let donor = &mut ctx.accounts.donor;
-            donor.shares = donor
-                .shares
-                .checked_sub(shares_to_burn)
-                .ok_or(CtoError::MathOverflow)?;
+            donor.shares = donor.shares.checked_sub(shares_to_burn).ok_or(CtoError::MathOverflow)?;
             donor.last_shares_change_slot = clock.slot;
         }
-
-        // H-04 FIX: Unlock after successful operation
-        unlock_pool!(ctx.accounts.pool);
-
-        // L-05 FIX: Emit withdrawal event
-        emit!(WithdrawalEvent {
-            pool: ctx.accounts.pool.key(),
-            donor: ctx.accounts.donor_wallet.key(),
-            lamports_out: received,
-            shares_burned: shares_to_burn,
-            timestamp: clock.slot as i64,
-        });
 
         Ok(())
     }
 
     /// Create a payout proposal.
+    ///
+    /// User inputs `requested_lamports` + destination + title/description.
+    /// Program computes `locked_pool_tokens` using the stake-pool rate at creation time, and adds
+    /// a 50bps buffer.
     pub fn create_proposal(
         ctx: Context<CreateProposal>,
         requested_lamports: u64,
@@ -454,88 +280,57 @@ pub mod cto_pools {
         description: String,
     ) -> Result<()> {
         require!(requested_lamports > 0, CtoError::ZeroAmount);
-        require!(title.as_bytes().len() <= Proposal::TITLE_MAX, CtoError::TitleTooLong);
-        require!(description.as_bytes().len() <= Proposal::DESC_MAX, CtoError::DescriptionTooLong);
 
-        let clock = Clock::get()?;
-
-        // ============ PHASE 1: Immutable reads and penalty fee CPI ============
-        // Read values needed for penalty fee calculation before any mutable borrows.
-        let base_penalty = ctx.accounts.pool.base_penalty_lamports;
-        let propose_strikes = ctx.accounts.donor.propose_strike_count;
-        let pool_key = ctx.accounts.pool.key();
-
-        // Escalating proposer penalty (uncapped). Collected into pool PDA.
-        let proposer_fee = penalty_fee(base_penalty, propose_strikes);
-        if proposer_fee > 0 {
-            invoke(
-                &system_instruction::transfer(&ctx.accounts.proposer_wallet.key(), &pool_key, proposer_fee),
-                &[ctx.accounts.proposer_wallet.to_account_info(), ctx.accounts.pool.to_account_info(), ctx.accounts.system_program.to_account_info()],
-            ).map_err(|_| CtoError::LamportTransferFailed)?;
-        }
-
-        // ============ PHASE 2: Mutable state and validation ============
         let pool = &mut ctx.accounts.pool;
         let donor = &ctx.accounts.donor;
         let proposal = &mut ctx.accounts.proposal;
+        let clock = Clock::get()?;
 
         require!(pool.active_proposal.is_none(), CtoError::ActiveProposalExists);
-        // Global cooldown after an Abort to allow withdrawals.
-        require!(clock.unix_timestamp >= pool.proposal_cooldown_until_ts, CtoError::ProposalCooldownActive);
         require!(donor.shares > 0, CtoError::NoShares);
 
-        // Block single-donor governance
+        // block single-donor governance
         require!(pool.total_shares != donor.shares, CtoError::SingleDonorCannotPropose);
 
-        // Holding delay for non-creator
+        // holding delay for non-creator
         if pool.creator != ctx.accounts.proposer_wallet.key() {
-            let slots_since = clock
-                .slot
-                .checked_sub(donor.last_shares_change_slot)
-                .ok_or(CtoError::MathOverflow)?;
+            let slots_since = clock.slot.checked_sub(donor.last_shares_change_slot).ok_or(CtoError::MathOverflow)?;
             require!(slots_since >= MIN_PROPOSAL_DELAY_SLOTS, CtoError::SharesTooRecent);
         }
 
+        // proposer value >= 1 SOL (in lamports) based on stake-pool rate now
         ctx.accounts.pool_lst_account.reload()?;
         pool.total_pool_tokens = ctx.accounts.pool_lst_account.amount;
         let stake_pool_state = read_stake_pool(&ctx.accounts.stake_pool)?;
 
-        // Enforce proposer value >= 1 SOL at current withdraw rate.
         let proposer_pool_tokens = ((donor.shares as u128)
-            .checked_mul(pool.total_pool_tokens as u128)
-            .ok_or(CtoError::MathOverflow)?)
-            .checked_div(pool.total_shares as u128)
-            .ok_or(CtoError::MathOverflow)?;
+            .checked_mul(pool.total_pool_tokens as u128).ok_or(CtoError::MathOverflow)?)
+            .checked_div(pool.total_shares as u128).ok_or(CtoError::MathOverflow)?;
         let proposer_pool_tokens = u64::try_from(proposer_pool_tokens).map_err(|_| CtoError::MathOverflow)?;
         let proposer_value_lamports = stake_pool_state
             .calc_lamports_withdraw_amount(proposer_pool_tokens)
             .ok_or(CtoError::MathOverflow)?;
-        require!(
-            proposer_value_lamports >= pool.min_proposer_deposit_lamports,
-            CtoError::ProposerTooSmall
-        );
+        require!(proposer_value_lamports >= pool.min_proposer_deposit_lamports, CtoError::ProposerTooSmall);
 
-        // Compute pool tokens to lock = ceil(requested * (1 + buffer))
+        // Compute pool tokens to lock = ceil(requested * (1+buffer))
         let buffered = requested_lamports
-            .checked_mul(BPS_DENOM + PROPOSAL_BUFFER_BPS)
+            .checked_mul(10_000 + PROPOSAL_BUFFER_BPS)
             .ok_or(CtoError::MathOverflow)?
-            .checked_div(BPS_DENOM)
+            .checked_div(10_000)
             .ok_or(CtoError::MathOverflow)?;
         let locked_pool_tokens = pool_tokens_for_lamports_ceil(&stake_pool_state, buffered)?;
 
+        // Ensure free
         let free_pool_tokens = pool
             .total_pool_tokens
             .checked_sub(pool.reserved_pool_tokens)
             .ok_or(CtoError::MathOverflow)?;
         require!(locked_pool_tokens <= free_pool_tokens, CtoError::InsufficientFreeLiquidity);
 
-        pool.reserved_pool_tokens = pool
-            .reserved_pool_tokens
-            .checked_add(locked_pool_tokens)
-            .ok_or(CtoError::MathOverflow)?;
+        pool.reserved_pool_tokens = pool.reserved_pool_tokens.checked_add(locked_pool_tokens).ok_or(CtoError::MathOverflow)?;
 
+        // init proposal
         proposal.pool = pool.key();
-        proposal.proposer_wallet = ctx.accounts.proposer_wallet.key();
         proposal.kind = ProposalKind::Payout;
         proposal.requested_lamports = requested_lamports;
         proposal.destination_wallet = destination_wallet;
@@ -543,10 +338,7 @@ pub mod cto_pools {
         proposal.description = description;
 
         proposal.created_at_ts = clock.unix_timestamp;
-        proposal.deadline_ts = clock
-            .unix_timestamp
-            .checked_add(24 * 60 * 60)
-            .ok_or(CtoError::MathOverflow)?;
+        proposal.deadline_ts = clock.unix_timestamp.checked_add(24 * 60 * 60).ok_or(CtoError::MathOverflow)?;
         proposal.snapshot_slot = clock.slot;
         proposal.total_snapshot_shares = pool.total_shares;
 
@@ -557,21 +349,9 @@ pub mod cto_pools {
         proposal.abstain_weight = 0;
         proposal.participation_weight = 0;
         proposal.status = ProposalStatus::Active;
-        proposal.abort_voter_1 = Pubkey::default();
-        proposal.abort_voter_2 = Pubkey::default();
-        proposal.abort_count = 0;
 
         pool.active_proposal = Some(proposal.key());
         pool.proposal_count = pool.proposal_count.checked_add(1).ok_or(CtoError::MathOverflow)?;
-
-        // L-05 FIX: Emit proposal created event
-        emit!(ProposalCreatedEvent {
-            pool: pool.key(),
-            proposal: proposal.key(),
-            proposer: ctx.accounts.proposer_wallet.key(),
-            requested_lamports,
-            timestamp: clock.unix_timestamp,
-        });
 
         Ok(())
     }
@@ -582,38 +362,33 @@ pub mod cto_pools {
         let donor = &ctx.accounts.donor;
         let vote_record = &mut ctx.accounts.vote_record;
         let clock = Clock::get()?;
+
         require!(proposal.status == ProposalStatus::Active, CtoError::ProposalNotActive);
         require!(clock.unix_timestamp <= proposal.deadline_ts, CtoError::VotingClosed);
         require!(donor.shares > 0, CtoError::NoShares);
 
-        // Must have shares before snapshot
-        require!(
-            donor.last_shares_change_slot <= proposal.snapshot_slot,
-            CtoError::NotEligibleForThisProposal
-        );
+        // must have shares before snapshot
+        require!(donor.last_shares_change_slot <= proposal.snapshot_slot, CtoError::NotEligibleForThisProposal);
 
-        // Remove previous vote weight, if re-voting.
+        // remove previous
         if vote_record.initialized {
             let w = vote_record.snapshot_weight;
             match vote_record.choice {
                 VoteChoice::Yes => proposal.yes_weight = proposal.yes_weight.checked_sub(w).ok_or(CtoError::MathOverflow)?,
                 VoteChoice::No => proposal.no_weight = proposal.no_weight.checked_sub(w).ok_or(CtoError::MathOverflow)?,
                 VoteChoice::Abstain => proposal.abstain_weight = proposal.abstain_weight.checked_sub(w).ok_or(CtoError::MathOverflow)?,
-                VoteChoice::Abort => { /* weights not affected */ },
             }
         }
 
-        // M-01 FIX: Use u128 for intermediate calculation to prevent overflow
-        // when total_snapshot_shares is very large (e.g., near u64::MAX)
+        // snapshot weight (capped)
         let snapshot_weight = if vote_record.initialized {
             vote_record.snapshot_weight
         } else {
             let raw = donor.shares;
-            let cap = ((proposal.total_snapshot_shares as u128)
-                .checked_mul(MAX_VOTER_BPS as u128)
-                .ok_or(CtoError::MathOverflow)?
-                .checked_div(BPS_DENOM as u128)
-                .ok_or(CtoError::MathOverflow)?) as u64;
+            let cap = proposal
+                .total_snapshot_shares
+                .checked_mul(MAX_VOTER_BPS as u64).ok_or(CtoError::MathOverflow)?
+                .checked_div(10_000).ok_or(CtoError::MathOverflow)?;
             raw.min(cap)
         };
 
@@ -621,15 +396,12 @@ pub mod cto_pools {
             VoteChoice::Yes => proposal.yes_weight = proposal.yes_weight.checked_add(snapshot_weight).ok_or(CtoError::MathOverflow)?,
             VoteChoice::No => proposal.no_weight = proposal.no_weight.checked_add(snapshot_weight).ok_or(CtoError::MathOverflow)?,
             VoteChoice::Abstain => proposal.abstain_weight = proposal.abstain_weight.checked_add(snapshot_weight).ok_or(CtoError::MathOverflow)?,
-            VoteChoice::Abort => { /* tracked separately */ },
         }
 
         proposal.participation_weight = proposal
             .yes_weight
-            .checked_add(proposal.no_weight)
-            .ok_or(CtoError::MathOverflow)?
-            .checked_add(proposal.abstain_weight)
-            .ok_or(CtoError::MathOverflow)?;
+            .checked_add(proposal.no_weight).ok_or(CtoError::MathOverflow)?
+            .checked_add(proposal.abstain_weight).ok_or(CtoError::MathOverflow)?;
 
         vote_record.proposal = proposal.key();
         vote_record.voter = donor.wallet;
@@ -637,139 +409,52 @@ pub mod cto_pools {
         vote_record.choice = choice;
         vote_record.initialized = true;
 
-        // === Abort tracking + penalty reset counters ===
-        // If voter participates normally (Yes/No), they progress toward resetting strike counters.
-        if matches!(choice, VoteChoice::Yes | VoteChoice::No) {
-            let d = &mut ctx.accounts.donor;
-            d.non_abort_participation_count = d.non_abort_participation_count.saturating_add(1);
-            if d.non_abort_participation_count >= 3 {
-                d.abort_strike_count = 0;
-                d.non_abort_participation_count = 0;
-            }
-            // Proposer strike reset requires sitting out proposing and voting on 3 proposals.
-            // Use proposal variable to avoid borrow conflict
-            if proposal.proposer_wallet != d.wallet {
-                d.non_propose_participation_count = d.non_propose_participation_count.saturating_add(1);
-                if d.non_propose_participation_count >= 3 {
-                    d.propose_strike_count = 0;
-                    d.non_propose_participation_count = 0;
-                }
-            }
-        }
-
-        if choice == VoteChoice::Abort {
-            // Eligibility for Abort vote (same as proposer: >= 1 SOL deposited, and stake held long enough)
-            require!(ctx.accounts.donor.total_deposited_lamports >= MIN_PROPOSER_DEPOSIT_LAMPORTS, CtoError::AbortNotEligible);
-            let slots_since = clock.slot.checked_sub(ctx.accounts.donor.last_shares_change_slot).ok_or(CtoError::MathOverflow)?;
-            require!(slots_since >= MIN_ABORTER_DELAY_SLOTS, CtoError::AbortNotEligible);
-            // Use proposal variable to avoid borrow conflict
-            require!(clock.unix_timestamp >= proposal.created_at_ts.checked_add(MIN_ABORT_REVIEW_SECONDS).ok_or(CtoError::MathOverflow)?, CtoError::AbortTooEarly);
-            // Charge escalating abort-vote fee into pool PDA (uncapped).
-            // This penalizes *both* abort voters, because each must sign to cast an Abort vote.
-            let fee = penalty_fee(ctx.accounts.pool.base_penalty_lamports, ctx.accounts.donor.abort_strike_count);
-            if fee > 0 {
-                invoke(
-                    &system_instruction::transfer(&ctx.accounts.voter_wallet.key(), &ctx.accounts.pool.key(), fee),
-                    &[
-                        ctx.accounts.voter_wallet.to_account_info(),
-                        ctx.accounts.pool.to_account_info(),
-                        ctx.accounts.system_program.to_account_info(),
-                    ],
-                )
-                .map_err(|_| CtoError::LamportTransferFailed)?;
-            }
-
-            // Increment abort strike immediately; reset requires 3 non-abort participations (Yes/No).
-            ctx.accounts.donor.abort_strike_count = ctx.accounts.donor.abort_strike_count.saturating_add(1);
-            ctx.accounts.donor.non_abort_participation_count = 0;
-
-
-            // Record up to 2 unique abort voters using proposal variable to avoid borrow conflict.
-            let voter = ctx.accounts.donor.wallet;
-            if proposal.abort_voter_1 == Pubkey::default() {
-                proposal.abort_voter_1 = voter;
-                proposal.abort_count = 1;
-            } else if proposal.abort_voter_1 == voter {
-                // already recorded
-            } else if proposal.abort_voter_2 == Pubkey::default() {
-                proposal.abort_voter_2 = voter;
-                proposal.abort_count = 2;
-            } else if proposal.abort_voter_2 == voter {
-                // already recorded
-            } else {
-                // only 2 abort voters tracked by design
-                return err!(CtoError::AbortVoterSlotsFull);
-            }
-        }
-
-        // L-05 FIX: Emit vote cast event
-        emit!(VoteCastEvent {
-            pool: ctx.accounts.pool.key(),
-            proposal: proposal.key(),
-            voter: ctx.accounts.voter_wallet.key(),
-            choice,
-            weight: snapshot_weight,
-            timestamp: clock.unix_timestamp,
-        });
-
         Ok(())
     }
 
     /// Execute proposal.
     ///
-    /// Atomic, community-executable flow:
-    /// - If proposal fails: unlock reserved liquidity and mark Failed.
-    /// - If proposal passes: withdraw SOL from stake-pool, pay destination, charge protocol fee.
-    /// - Fee split:
-    ///   * 50% -> dev wallet
-    ///   * 50% -> buy & burn CTOP (best-effort). If swap fails, that half is also sent to dev.
-    ///
-    /// Key property: Buy & burn failure never prevents the payout leg from succeeding.
+    /// - If failed: unlock reserved
+    /// - If passed: withdraw locked pool tokens to SOL, compute fee as % of actual SOL received,
+    ///   send net to destination.
+    /// - Fee split: 50% to dev, 50% buy&burn CTOP; if swap fails, remainder to dev.
     pub fn execute_proposal(mut ctx: Context<ExecuteProposal>, minimum_lamports_out: u64) -> Result<()> {
         let clock = Clock::get()?;
+
         // ============ PHASE 1: Immutable reads and status checks ============
-        require!(ctx.accounts.proposal.status == ProposalStatus::Active, CtoError::ProposalNotActive);
+        let proposal_status = ctx.accounts.proposal.status.clone();
+        require!(proposal_status == ProposalStatus::Active, CtoError::ProposalNotActive);
 
-        // H-04 FIX: Reentrancy guard - lock before CPI
-        lock_pool!(ctx.accounts.pool);
-
+        // Read all values we need before any mutable borrows
         let participation_weight = ctx.accounts.proposal.participation_weight;
         let total_snapshot_shares = ctx.accounts.proposal.total_snapshot_shares;
         let locked_pool_tokens = ctx.accounts.proposal.locked_pool_tokens;
         let yes_weight = ctx.accounts.proposal.yes_weight;
         let no_weight = ctx.accounts.proposal.no_weight;
         let deadline_ts = ctx.accounts.proposal.deadline_ts;
+        let proposal_key = ctx.accounts.proposal.key();
 
         let quorum_bps = ctx.accounts.pool.quorum_bps;
         let protocol_fee_bps = ctx.accounts.pool.protocol_fee_bps;
-
         let pool_token_mint = ctx.accounts.pool.token_mint;
         let pool_bump = ctx.bumps.pool;
-
-        let pumpswap_enabled = ctx.accounts.pool.pumpswap_enabled;
         let raydium_enabled = ctx.accounts.pool.raydium_enabled;
-
+        let raydium_pool_id = ctx.accounts.pool.raydium_pool_id;
         let pool_key = ctx.accounts.pool.key();
-        let proposal_key = ctx.accounts.proposal.key();
 
         let quorum_met = participation_weight
-            .checked_mul(BPS_DENOM)
-            .ok_or(CtoError::MathOverflow)?
+            .checked_mul(10_000).ok_or(CtoError::MathOverflow)?
             >= total_snapshot_shares
-                .checked_mul(quorum_bps as u64)
-                .ok_or(CtoError::MathOverflow)?;
+                .checked_mul(quorum_bps as u64).ok_or(CtoError::MathOverflow)?;
 
         let time_over = clock.unix_timestamp >= deadline_ts;
         require!(time_over || quorum_met, CtoError::TooEarlyToExecute);
-
-        // Even if quorum is met early, enforce a minimum review window before any execution.
-        let min_delay_over = clock.unix_timestamp >= ctx.accounts.proposal.created_at_ts.checked_add(MIN_EXECUTE_DELAY_SECONDS).ok_or(CtoError::MathOverflow)?;
-        require!(min_delay_over, CtoError::TooEarlyToExecuteMinDelay);
 
         let majority_met = yes_weight > no_weight;
 
         // ============ FAIL PATH ============
         if !(quorum_met && majority_met) {
+            // Update state for failure in scoped blocks
             {
                 let pool = &mut ctx.accounts.pool;
                 pool.reserved_pool_tokens = pool
@@ -799,27 +484,25 @@ pub mod cto_pools {
         let pool_tokens_to_burn = locked_pool_tokens;
         require!(pool_tokens_to_burn > 0, CtoError::MathOverflow);
 
-        // ============ PHASE 2: CPIs ============
+        // ============ PHASE 2: CPIs (no mutable account data borrows) ============
         // Withdraw SOL to pool PDA
         let pre_pool_lamports = ctx.accounts.pool.to_account_info().lamports();
-        stake_pool_withdraw_sol_exec(&ctx, pool_tokens_to_burn, minimum_lamports_out)?;
+        stake_pool_withdraw_sol_exec(
+            &ctx,
+            pool_tokens_to_burn,
+            minimum_lamports_out,
+        )?;
         let post_pool_lamports = ctx.accounts.pool.to_account_info().lamports();
-        let sol_received = post_pool_lamports
-            .checked_sub(pre_pool_lamports)
-            .ok_or(CtoError::MathOverflow)?;
+        let sol_received = post_pool_lamports.checked_sub(pre_pool_lamports).ok_or(CtoError::MathOverflow)?;
         require!(sol_received >= minimum_lamports_out, CtoError::SlippageExceeded);
 
         // Fee is % of actual received
         let protocol_fee = sol_received
-            .checked_mul(protocol_fee_bps as u64)
-            .ok_or(CtoError::MathOverflow)?
-            .checked_div(BPS_DENOM)
-            .ok_or(CtoError::MathOverflow)?;
-        let net_to_destination = sol_received
-            .checked_sub(protocol_fee)
-            .ok_or(CtoError::MathOverflow)?;
+            .checked_mul(protocol_fee_bps as u64).ok_or(CtoError::MathOverflow)?
+            .checked_div(10_000).ok_or(CtoError::MathOverflow)?;
+        let net_to_destination = sol_received.checked_sub(protocol_fee).ok_or(CtoError::MathOverflow)?;
 
-        // Pay destination
+        // Pay destination (gets ALL net; if sol_received was > estimated, they benefit)
         transfer_lamports_signed(
             &ctx.accounts.pool.to_account_info(),
             &ctx.accounts.destination_wallet.to_account_info(),
@@ -831,19 +514,11 @@ pub mod cto_pools {
         let fee_half = protocol_fee.checked_div(2).ok_or(CtoError::MathOverflow)?;
         let mut dev_take = protocol_fee.checked_sub(fee_half).ok_or(CtoError::MathOverflow)?;
 
-        // Buy & burn attempt with `fee_half` (best-effort).
+        // Buy&burn attempt with `fee_half`.
+        // If it fails, send that half to dev.
         if fee_half > 0 {
-            // Prefer PumpSwap for Pump.fun launches after graduation.
-            let did_try_pumpswap = pumpswap_enabled
-                && ctx.accounts.pool.pumpswap_pool_id != Pubkey::default()
-                && ctx.accounts.pumpswap_pool.key() == ctx.accounts.pool.pumpswap_pool_id
-                && ctx.accounts.pumpswap_pool_base_vault.key() == ctx.accounts.pool.pumpswap_base_vault
-                && ctx.accounts.pumpswap_pool_quote_vault.key() == ctx.accounts.pool.pumpswap_quote_vault
-                && ctx.accounts.pumpswap_global_config.key() == ctx.accounts.pool.pumpswap_global_config
-                && ctx.accounts.pumpswap_protocol_fee_recipient.key() == ctx.accounts.pool.pumpswap_fee_recipient;
-
-            if did_try_pumpswap {
-                match attempt_pumpswap_swap_and_burn(&mut ctx, fee_half, pool_bump) {
+            if raydium_enabled && ctx.accounts.raydium_pool.key() == raydium_pool_id && raydium_pool_id != Pubkey::default() {
+                match attempt_swap_and_burn(&mut ctx, fee_half, pool_bump) {
                     Ok(ctop_burned) => {
                         emit!(TokenBurnEvent {
                             pool: pool_key,
@@ -853,18 +528,16 @@ pub mod cto_pools {
                         });
                     }
                     Err(_e) => {
-                        // Best-effort means failure routes to dev.
                         dev_take = dev_take.checked_add(fee_half).ok_or(CtoError::MathOverflow)?;
                         emit!(SwapFailureEvent {
                             pool: pool_key,
                             amount_sol: fee_half,
-                            error_code: 1, // PumpSwap failure
+                            error_code: 0,
                             timestamp: clock.unix_timestamp,
                         });
                     }
                 }
             } else {
-                // No configured venue -> send to dev (explicitly accepted design)
                 dev_take = dev_take.checked_add(fee_half).ok_or(CtoError::MathOverflow)?;
             }
         }
@@ -883,17 +556,11 @@ pub mod cto_pools {
         ctx.accounts.pool_lst_account.reload()?;
         let final_pool_tokens = ctx.accounts.pool_lst_account.amount;
 
-        // ============ PHASE 3: Mutable state updates ============
+        // ============ PHASE 3: Mutable state updates (scoped) ============
         {
             let pool = &mut ctx.accounts.pool;
-            pool.total_spent_lamports = pool
-                .total_spent_lamports
-                .checked_add(net_to_destination)
-                .ok_or(CtoError::MathOverflow)?;
-            pool.reserved_pool_tokens = pool
-                .reserved_pool_tokens
-                .checked_sub(pool_tokens_to_burn)
-                .ok_or(CtoError::MathOverflow)?;
+            pool.total_spent_lamports = pool.total_spent_lamports.checked_add(net_to_destination).ok_or(CtoError::MathOverflow)?;
+            pool.reserved_pool_tokens = pool.reserved_pool_tokens.checked_sub(pool_tokens_to_burn).ok_or(CtoError::MathOverflow)?;
             pool.total_pool_tokens = final_pool_tokens;
             pool.active_proposal = None;
         }
@@ -902,22 +569,19 @@ pub mod cto_pools {
             proposal.status = ProposalStatus::Executed;
         }
 
-        // H-04 FIX: Unlock after successful operation
-        unlock_pool!(ctx.accounts.pool);
-
-        // L-05 FIX: Emit proposal executed event
-        emit!(ProposalExecutedEvent {
-            pool: pool_key,
-            proposal: proposal_key,
-            lamports_paid: net_to_destination,
-            protocol_fee,
-            timestamp: clock.unix_timestamp,
-        });
-
         Ok(())
     }
 
     /// Recover non-LST assets stuck in the pool.
+    ///
+    /// Reality check: the program cannot reliably determine the "sender" of an accidental SPL-token
+    /// transfer or a bare SOL transfer that happened in the past. If you want a true "sender can
+    /// instantly reclaim" path, you need a *receipt* created by a dedicated deposit flow.
+    ///
+    /// Therefore this function provides:
+    /// - Governance recovery proposal (NO fee) for SPL tokens *other than* the configured LST.
+    /// - Optional immediate recovery in the same transaction ONLY when the caller proves they are
+    ///   the sender by bundling the transfer + recover in one tx and passing `instructions` sysvar.
     pub fn recover_funds_create(
         ctx: Context<RecoverFundsCreate>,
         token_mint: Pubkey,
@@ -927,20 +591,15 @@ pub mod cto_pools {
         description: String,
     ) -> Result<()> {
         require!(amount > 0, CtoError::ZeroAmount);
-        require!(title.as_bytes().len() <= RecoveryProposal::TITLE_MAX, CtoError::TitleTooLong);
-        require!(description.as_bytes().len() <= RecoveryProposal::DESC_MAX, CtoError::DescriptionTooLong);
         require!(token_mint != ctx.accounts.pool.lst_mint, CtoError::RecoveryNotAllowedForLST);
 
+        // Extract pool bump and token_mint before any mutable borrows
         let pool_bump = ctx.bumps.pool;
         let pool_token_mint = ctx.accounts.pool.token_mint;
 
-        if verify_inline_sender(
-            &ctx.accounts.instructions,
-            &ctx.accounts.requester.key(),
-            &ctx.accounts.pool_token_account.key(),
-            token_mint,
-            amount,
-        )? {
+        // fast-path: if caller can prove they sent those tokens in *this same tx*, allow immediate
+        // recovery. (Otherwise, governance proposal.)
+        if verify_inline_sender(&ctx.accounts.instructions, &ctx.accounts.requester.key(), &ctx.accounts.pool_token_account.key(), token_mint, amount)? {
             transfer_spl_from_pool_with_seeds(
                 &ctx.accounts.pool.to_account_info(),
                 &ctx.accounts.pool_token_account,
@@ -952,21 +611,15 @@ pub mod cto_pools {
             return Ok(());
         }
 
+        // Governance proposal (no fee)
         let pool = &mut ctx.accounts.pool;
         let donor = &ctx.accounts.donor;
-        let clock = Clock::get()?;
-        
-        // H-01 FIX: Recovery proposals should also be affected by the abort cooldown.
-        // The abort cooldown is meant to be a safe time for donors to withdraw their funds if they think they are at risk.
-        require!(
-            clock.unix_timestamp >= pool.proposal_cooldown_until_ts,
-            CtoError::ProposalCooldownActive
-        );
-        
         require!(pool.active_recovery.is_none(), CtoError::ActiveRecoveryExists);
         require!(donor.shares > 0, CtoError::NoShares);
 
+        // Initialize recovery proposal
         let rec = &mut ctx.accounts.recovery;
+        let clock = Clock::get()?;
         rec.pool = pool.key();
         rec.token_mint = token_mint;
         rec.requested_amount = amount;
@@ -974,10 +627,7 @@ pub mod cto_pools {
         rec.title = title;
         rec.description = description;
         rec.created_at_ts = clock.unix_timestamp;
-        rec.deadline_ts = clock
-            .unix_timestamp
-            .checked_add(24 * 60 * 60)
-            .ok_or(CtoError::MathOverflow)?;
+        rec.deadline_ts = clock.unix_timestamp.checked_add(24 * 60 * 60).ok_or(CtoError::MathOverflow)?;
         rec.snapshot_slot = clock.slot;
         rec.total_snapshot_shares = pool.total_shares;
         rec.yes_weight = 0;
@@ -992,20 +642,17 @@ pub mod cto_pools {
         Ok(())
     }
 
-    /// L-06 FIX: Recovery proposals should have abort also, same as regular proposals.
-    /// This provides consistent emergency brake capabilities across all proposal types.
     pub fn recover_funds_vote(ctx: Context<RecoverFundsVote>, choice: VoteChoice) -> Result<()> {
+        // re-use same vote logic
         let proposal = &mut ctx.accounts.recovery;
         let donor = &ctx.accounts.donor;
         let vote_record = &mut ctx.accounts.vote_record;
         let clock = Clock::get()?;
+
         require!(proposal.status == ProposalStatus::Active, CtoError::ProposalNotActive);
         require!(clock.unix_timestamp <= proposal.deadline_ts, CtoError::VotingClosed);
         require!(donor.shares > 0, CtoError::NoShares);
-        require!(
-            donor.last_shares_change_slot <= proposal.snapshot_slot,
-            CtoError::NotEligibleForThisProposal
-        );
+        require!(donor.last_shares_change_slot <= proposal.snapshot_slot, CtoError::NotEligibleForThisProposal);
 
         if vote_record.initialized {
             let w = vote_record.snapshot_weight;
@@ -1013,62 +660,30 @@ pub mod cto_pools {
                 VoteChoice::Yes => proposal.yes_weight = proposal.yes_weight.checked_sub(w).ok_or(CtoError::MathOverflow)?,
                 VoteChoice::No => proposal.no_weight = proposal.no_weight.checked_sub(w).ok_or(CtoError::MathOverflow)?,
                 VoteChoice::Abstain => proposal.abstain_weight = proposal.abstain_weight.checked_sub(w).ok_or(CtoError::MathOverflow)?,
-                VoteChoice::Abort => unreachable!(),
             }
         }
 
-        // M-01 FIX: Use u128 for intermediate calculation to prevent overflow
-        // when total_snapshot_shares is very large
         let snapshot_weight = if vote_record.initialized {
             vote_record.snapshot_weight
         } else {
             let raw = donor.shares;
-            let cap = ((proposal.total_snapshot_shares as u128)
-                .checked_mul(MAX_VOTER_BPS as u128)
-                .ok_or(CtoError::MathOverflow)?
-                .checked_div(BPS_DENOM as u128)
-                .ok_or(CtoError::MathOverflow)?) as u64;
+            let cap = proposal
+                .total_snapshot_shares
+                .checked_mul(MAX_VOTER_BPS as u64).ok_or(CtoError::MathOverflow)?
+                .checked_div(10_000).ok_or(CtoError::MathOverflow)?;
             raw.min(cap)
         };
-
-        // L-06 FIX: Handle abort voting for recovery proposals (same as regular proposals)
-        if choice == VoteChoice::Abort {
-            // Eligibility for Abort vote (same as proposer: >= 1 SOL deposited, and stake held long enough)
-            require!(donor.total_deposited_lamports >= MIN_PROPOSER_DEPOSIT_LAMPORTS, CtoError::AbortNotEligible);
-            let slots_since = clock.slot.checked_sub(donor.last_shares_change_slot).ok_or(CtoError::MathOverflow)?;
-            require!(slots_since >= MIN_ABORTER_DELAY_SLOTS, CtoError::AbortNotEligible);
-            require!(clock.unix_timestamp >= proposal.created_at_ts.checked_add(MIN_ABORT_REVIEW_SECONDS).ok_or(CtoError::MathOverflow)?, CtoError::AbortTooEarly);
-
-            // Record up to 2 unique abort voters.
-            let voter = donor.wallet;
-            if proposal.abort_voter_1 == Pubkey::default() {
-                proposal.abort_voter_1 = voter;
-                proposal.abort_count = 1;
-            } else if proposal.abort_voter_1 == voter {
-                // already recorded
-            } else if proposal.abort_voter_2 == Pubkey::default() {
-                proposal.abort_voter_2 = voter;
-                proposal.abort_count = 2;
-            } else if proposal.abort_voter_2 == voter {
-                // already recorded
-            } else {
-                return err!(CtoError::AbortVoterSlotsFull);
-            }
-        }
 
         match choice {
             VoteChoice::Yes => proposal.yes_weight = proposal.yes_weight.checked_add(snapshot_weight).ok_or(CtoError::MathOverflow)?,
             VoteChoice::No => proposal.no_weight = proposal.no_weight.checked_add(snapshot_weight).ok_or(CtoError::MathOverflow)?,
             VoteChoice::Abstain => proposal.abstain_weight = proposal.abstain_weight.checked_add(snapshot_weight).ok_or(CtoError::MathOverflow)?,
-            VoteChoice::Abort => { /* tracked separately via abort_voter fields */ },
         }
 
         proposal.participation_weight = proposal
             .yes_weight
-            .checked_add(proposal.no_weight)
-            .ok_or(CtoError::MathOverflow)?
-            .checked_add(proposal.abstain_weight)
-            .ok_or(CtoError::MathOverflow)?;
+            .checked_add(proposal.no_weight).ok_or(CtoError::MathOverflow)?
+            .checked_add(proposal.abstain_weight).ok_or(CtoError::MathOverflow)?;
 
         vote_record.proposal = proposal.key();
         vote_record.voter = donor.wallet;
@@ -1079,52 +694,10 @@ pub mod cto_pools {
         Ok(())
     }
 
-    /// Finalize an Abort once 2 eligible wallets have voted Abort.
-    ///
-    /// Effects:
-    /// - Unlocks reserved liquidity for this proposal
-    /// - Marks proposal Aborted
-    /// - Clears active_proposal
-    /// - Sets pool cooldown window
-    /// - Increments proposer strike (proposer pays next time they create a proposal)
-    pub fn abort_proposal(ctx: Context<AbortProposal>) -> Result<()> {
-        let clock = Clock::get()?;
-
-        require!(ctx.accounts.proposal.status == ProposalStatus::Active, CtoError::ProposalNotActive);
-        require!(ctx.accounts.proposal.abort_count >= 2, CtoError::AbortThresholdNotMet);
-        require!(clock.unix_timestamp >= ctx.accounts.proposal.created_at_ts.checked_add(MIN_ABORT_REVIEW_SECONDS).ok_or(CtoError::MathOverflow)?, CtoError::AbortTooEarly);
-
-        // Aborter must be one of the recorded abort voters
-        let aborter = ctx.accounts.aborter.wallet;
-        require!(aborter == ctx.accounts.proposal.abort_voter_1 || aborter == ctx.accounts.proposal.abort_voter_2, CtoError::AbortNotEligible);
-
-        // Unlock reserved liquidity
-        let locked = ctx.accounts.proposal.locked_pool_tokens;
-        ctx.accounts.pool.reserved_pool_tokens = ctx.accounts.pool.reserved_pool_tokens.checked_sub(locked).ok_or(CtoError::MathOverflow)?;
-        ctx.accounts.pool.active_proposal = None;
-
-        // Apply global cooldown
-        ctx.accounts.pool.proposal_cooldown_until_ts = clock.unix_timestamp.checked_add(COOLDOWN_AFTER_ABORT_SECONDS).ok_or(CtoError::MathOverflow)?;
-        // Penalize proposer: aborted proposals raise the next proposal-creation fee (uncapped)
-        ctx.accounts.proposer_donor.propose_strike_count = ctx.accounts.proposer_donor.propose_strike_count.saturating_add(1);
-        ctx.accounts.proposer_donor.non_propose_participation_count = 0;
-
-        // Mark proposal aborted
-        ctx.accounts.proposal.status = ProposalStatus::Aborted;
-
-        // L-05 FIX: Emit proposal aborted event
-        emit!(ProposalAbortedEvent {
-            pool: ctx.accounts.pool.key(),
-            proposal: ctx.accounts.proposal.key(),
-            abort_voters: [ctx.accounts.proposal.abort_voter_1, ctx.accounts.proposal.abort_voter_2],
-            timestamp: clock.unix_timestamp,
-        });
-
-        Ok(())
-    }
-
     pub fn recover_funds_execute(ctx: Context<RecoverFundsExecute>) -> Result<()> {
         let clock = Clock::get()?;
+
+        // Extract values needed before mutable borrows
         let pool_bump = ctx.bumps.pool;
         let pool_token_mint = ctx.accounts.pool.token_mint;
         let pool_quorum_bps = ctx.accounts.pool.quorum_bps;
@@ -1136,12 +709,10 @@ pub mod cto_pools {
 
         let quorum_met = rec
             .participation_weight
-            .checked_mul(BPS_DENOM)
-            .ok_or(CtoError::MathOverflow)?
+            .checked_mul(10_000).ok_or(CtoError::MathOverflow)?
             >= rec
                 .total_snapshot_shares
-                .checked_mul(pool_quorum_bps as u64)
-                .ok_or(CtoError::MathOverflow)?;
+                .checked_mul(pool_quorum_bps as u64).ok_or(CtoError::MathOverflow)?;
 
         let time_over = clock.unix_timestamp >= rec.deadline_ts;
         require!(time_over || quorum_met, CtoError::TooEarlyToExecute);
@@ -1154,6 +725,7 @@ pub mod cto_pools {
             return Ok(());
         }
 
+        // NO FEE recovery: transfer SPL tokens from pool token account to destination.
         transfer_spl_from_pool_with_seeds(
             &ctx.accounts.pool.to_account_info(),
             &ctx.accounts.pool_token_account,
@@ -1172,45 +744,41 @@ pub mod cto_pools {
 
 // ============= Helper Functions =============
 
-/// Uncapped exponential penalty fee: base * 2^strikes
-fn penalty_fee(base: u64, strikes: u16) -> u64 {
-    if strikes == 0 {
-        return 0;
-    }
-    let shift = strikes as u32;
-    base.checked_shl(shift).unwrap_or(u64::MAX)
-}
-
-
 /// Validates the stake pool configuration against known Jito deployments.
 /// This function ensures only trusted stake pool programs are used.
 fn validate_stake_pool_config(stake_pool_program: Pubkey, stake_pool: Pubkey, lst_mint: Pubkey) -> Result<()> {
+    // For safety in early versions, allow:
+    // - Jito devnet triplet
+    // - Jito mainnet program (stake_pool/mint not hard-coded here)
+    // - Any other config ONLY if you explicitly want it (remove this require!)
+
     let is_devnet = stake_pool_program == JITO_DEVNET_STAKE_POOL_PROGRAM
         && stake_pool == JITO_DEVNET_STAKE_POOL
         && lst_mint == JITO_DEVNET_JITOSOL_MINT;
 
-    // Mainnet & Testnet use the SPL Stake Pool program plus the Jito stake pool + jitoSOL mint.
-    let is_mainnet_or_testnet = stake_pool_program == JITO_MAINNET_STAKE_POOL_PROGRAM
-        && stake_pool == JITO_MAINNET_STAKE_POOL
-        && lst_mint == JITO_MAINNET_JITOSOL_MINT;
+    let is_mainnet_program = stake_pool_program == JITO_MAINNET_STAKE_POOL_PROGRAM;
 
-    require!(is_devnet || is_mainnet_or_testnet, CtoError::InvalidStakePoolConfig);
+    require!(is_devnet || is_mainnet_program, CtoError::InvalidStakePoolConfig);
     Ok(())
 }
 
 /// Reads and deserializes the StakePool state from an AccountInfo.
-///
-/// The spl_stake_pool 2.x crate uses borsh 1.x internally.
-/// We use the renamed `borsh_1` crate (borsh 1.5) to avoid conflict with anchor's borsh 0.10.
+/// Uses borsh v1 (borsh1 crate) for deserialization since spl-stake-pool uses borsh 1.x
+/// while anchor-lang uses borsh 0.10.x. The StakePool struct implements BorshDeserialize
+/// from borsh 1.x, so we must use that version for correct deserialization.
 fn read_stake_pool(stake_pool_ai: &AccountInfo) -> Result<StakePool> {
     let data = stake_pool_ai.try_borrow_data().map_err(|_| CtoError::InvalidAccountData)?;
-    borsh_1::BorshDeserialize::try_from_slice(&data[..]).map_err(|_| CtoError::InvalidAccountData.into())
+    // Use borsh1 (borsh v1.x) for deserialization - StakePool uses this version
+    borsh1::BorshDeserialize::deserialize(&mut &data[..])
+        .map_err(|_| CtoError::InvalidAccountData.into())
 }
 
 /// Compute the minimum pool tokens that should produce at least `lamports_out` when withdrawing.
 ///
 /// We compute a ceiling estimate from the current ratio.
 fn pool_tokens_for_lamports_ceil(stake_pool: &StakePool, lamports_out: u64) -> Result<u64> {
+    // Use rational: pool_tokens ~= lamports_out * pool_token_supply / total_lamports
+    // If total_lamports==0, can't.
     require!(stake_pool.total_lamports > 0, CtoError::StakePoolEmpty);
 
     let num = (lamports_out as u128)
@@ -1246,12 +814,9 @@ fn transfer_lamports_signed<'info>(
 fn stake_pool_deposit_sol(ctx: &Context<DonateSol>, lamports_in: u64, minimum_pool_tokens_out: u64) -> Result<()> {
     let pool = &ctx.accounts.pool;
 
-    require!(
-        ctx.accounts.stake_pool_program.key() == pool.stake_pool_program
-            && ctx.accounts.stake_pool.key() == pool.stake_pool
-            && ctx.accounts.lst_mint.key() == pool.lst_mint,
-        CtoError::InvalidStakePoolConfig
-    );
+    require!(ctx.accounts.stake_pool_program.key() == pool.stake_pool_program, CtoError::InvalidStakePoolConfig);
+    require!(ctx.accounts.stake_pool.key() == pool.stake_pool, CtoError::InvalidStakePoolConfig);
+    require!(ctx.accounts.lst_mint.key() == pool.lst_mint, CtoError::InvalidStakePoolConfig);
 
     let ix = stake_pool_ix::deposit_sol_with_slippage(
         &pool.stake_pool_program,
@@ -1268,6 +833,7 @@ fn stake_pool_deposit_sol(ctx: &Context<DonateSol>, lamports_in: u64, minimum_po
         minimum_pool_tokens_out,
     );
 
+    // Must include accounts used by the stake pool program.
     invoke(
         &ix,
         &[
@@ -1281,6 +847,7 @@ fn stake_pool_deposit_sol(ctx: &Context<DonateSol>, lamports_in: u64, minimum_po
             ctx.accounts.lst_mint.to_account_info(),
             ctx.accounts.system_program.to_account_info(),
             ctx.accounts.token_program.to_account_info(),
+            // optional deposit authority not used
         ],
     )
     .map_err(|_| CtoError::StakePoolCpiFailed.into())
@@ -1290,21 +857,18 @@ fn stake_pool_deposit_sol(ctx: &Context<DonateSol>, lamports_in: u64, minimum_po
 fn stake_pool_withdraw_sol(ctx: &Context<WithdrawSol>, pool_tokens_in: u64, minimum_lamports_out: u64) -> Result<()> {
     let pool = &ctx.accounts.pool;
 
-    require!(
-        ctx.accounts.stake_pool_program.key() == pool.stake_pool_program
-            && ctx.accounts.stake_pool.key() == pool.stake_pool
-            && ctx.accounts.lst_mint.key() == pool.lst_mint,
-        CtoError::InvalidStakePoolConfig
-    );
+    require!(ctx.accounts.stake_pool_program.key() == pool.stake_pool_program, CtoError::InvalidStakePoolConfig);
+    require!(ctx.accounts.stake_pool.key() == pool.stake_pool, CtoError::InvalidStakePoolConfig);
+    require!(ctx.accounts.lst_mint.key() == pool.lst_mint, CtoError::InvalidStakePoolConfig);
 
     let ix = stake_pool_ix::withdraw_sol_with_slippage(
         &pool.stake_pool_program,
         &pool.stake_pool,
         &ctx.accounts.stake_pool_withdraw_authority.key(),
-        &pool.key(),
+        &pool.key(), // user_transfer_authority = pool PDA
         &ctx.accounts.pool_lst_account.key(),
         &ctx.accounts.reserve_stake.key(),
-        &pool.key(),
+        &pool.key(), // lamports_to = pool PDA (system account)
         &ctx.accounts.manager_fee_account.key(),
         &ctx.accounts.lst_mint.key(),
         &ctx.accounts.token_program.key(),
@@ -1327,6 +891,7 @@ fn stake_pool_withdraw_sol(ctx: &Context<WithdrawSol>, pool_tokens_in: u64, mini
             ctx.accounts.stake_history.to_account_info(),
             ctx.accounts.stake_program.to_account_info(),
             ctx.accounts.token_program.to_account_info(),
+            // optional sol withdraw authority not used
         ],
         pool_seeds!(pool, ctx.bumps.pool),
     )
@@ -1337,12 +902,9 @@ fn stake_pool_withdraw_sol(ctx: &Context<WithdrawSol>, pool_tokens_in: u64, mini
 fn stake_pool_withdraw_sol_exec(ctx: &Context<ExecuteProposal>, pool_tokens_in: u64, minimum_lamports_out: u64) -> Result<()> {
     let pool = &ctx.accounts.pool;
 
-    require!(
-        ctx.accounts.stake_pool_program.key() == pool.stake_pool_program
-            && ctx.accounts.stake_pool.key() == pool.stake_pool
-            && ctx.accounts.lst_mint.key() == pool.lst_mint,
-        CtoError::InvalidStakePoolConfig
-    );
+    require!(ctx.accounts.stake_pool_program.key() == pool.stake_pool_program, CtoError::InvalidStakePoolConfig);
+    require!(ctx.accounts.stake_pool.key() == pool.stake_pool, CtoError::InvalidStakePoolConfig);
+    require!(ctx.accounts.lst_mint.key() == pool.lst_mint, CtoError::InvalidStakePoolConfig);
 
     let ix = stake_pool_ix::withdraw_sol_with_slippage(
         &pool.stake_pool_program,
@@ -1380,70 +942,24 @@ fn stake_pool_withdraw_sol_exec(ctx: &Context<ExecuteProposal>, pool_tokens_in: 
     .map_err(|_| CtoError::StakePoolCpiFailed.into())
 }
 
-// ===== Buy & burn helpers =====
+// ===== CTOP buy & burn (Raydium) =====
 
-/// Attempts to swap SOL for CTOP on PumpSwap and burn to incinerator.
+/// Attempts to swap SOL for CTOP and send to incinerator for burning.
 /// Returns the amount of CTOP burned on success.
-fn attempt_pumpswap_swap_and_burn<'info>(
-    ctx: &mut Context<ExecuteProposal<'info>>,
-    amount_sol: u64,
-    pool_bump: u8,
-) -> Result<u64> {
-    // Basic safety: ensure we're calling the canonical PumpSwap program id.
-    require!(
-        ctx.accounts.pumpswap_program.key() == PUMPSWAP_PROGRAM_ID,
-        CtoError::InvalidPumpSwapConfig
-    );
-
-    // H-05 FIX: Validate PumpSwap version before swap
-    require!(
-        ctx.accounts.pool.pumpswap_version == PUMPSWAP_EXPECTED_VERSION,
-        CtoError::PumpSwapVersionMismatch
-    );
-
-    // Prevent executor “account injection”:
-    // - Vaults must hold the expected mints (CTOP and WSOL).
-    // - Swap output is forced into pool_ctop_account (PDA-owned), and then burned.
-    validate_pumpswap_vault_mints(ctx)?;
-
-    // Wrap SOL into WSOL held by the pool PDA
-    wrap_sol_to_wsol(ctx, amount_sol, pool_bump)?;
-
-    // On-chain frontrun protection:
-    // Compute min-out from current vault reserves, then apply slippage bps.
-    let min_ctop = compute_min_out_cpmm_from_vaults(
-        ctx.accounts.pumpswap_pool_quote_vault.amount, // WSOL reserve
-        ctx.accounts.pumpswap_pool_base_vault.amount,  // CTOP reserve
-        amount_sol,
-        MAX_SLIPPAGE_BPS,
-    )?;
-
-    // Perform PumpSwap buy: spend up to `amount_sol` WSOL, receive at least `min_ctop` CTOP.
-    perform_pumpswap_buy(ctx, min_ctop, amount_sol, pool_bump)?;
-
-    // Burn everything acquired by transferring to the incinerator ATA.
-    transfer_to_incinerator(ctx, pool_bump)
-}
-
-/// Legacy Raydium buy & burn (optional).
-fn attempt_raydium_swap_and_burn<'info>(
+fn attempt_swap_and_burn<'info>(
     ctx: &mut Context<ExecuteProposal<'info>>,
     amount_sol: u64,
     pool_bump: u8,
 ) -> Result<u64> {
     wrap_sol_to_wsol(ctx, amount_sol, pool_bump)?;
-    // NOTE: This is still heuristic for Raydium. Prefer PumpSwap path for Pump.fun launches.
-    let min_ctop = calculate_minimum_amount_out_heuristic(amount_sol, MAX_SLIPPAGE_BPS)?;
+    let min_ctop = calculate_minimum_amount_out(amount_sol, MAX_SLIPPAGE_BPS)?;
     perform_raydium_swap(ctx, amount_sol, min_ctop, pool_bump)?;
     transfer_to_incinerator(ctx, pool_bump)
 }
 
-/// Wraps native SOL into WSOL by transferring SOL to the pool's WSOL token account and syncing.
-fn wrap_sol_to_wsol<'info>(
-    ctx: &mut Context<ExecuteProposal<'info>>,
-    amount: u64,
-    pool_bump: u8,
-) -> Result<()> {
+/// Wraps native SOL into WSOL by transferring SOL to the pool's WSOL token account.
+fn wrap_sol_to_wsol<'info>(ctx: &mut Context<ExecuteProposal<'info>>, amount: u64, pool_bump: u8) -> Result<()> {
+    // move SOL from pool PDA to its WSOL token account
     invoke_signed(
         &system_instruction::transfer(&ctx.accounts.pool.key(), &ctx.accounts.pool_wsol_account.key(), amount),
         &[
@@ -1454,177 +970,36 @@ fn wrap_sol_to_wsol<'info>(
     )
     .map_err(|_| CtoError::LamportTransferFailed)?;
 
-    token::sync_native(CpiContext::new(
-        ctx.accounts.token_program.to_account_info(),
-        token::SyncNative {
-            account: ctx.accounts.pool_wsol_account.to_account_info(),
-        },
-    ))?;
-
+    token::sync_native(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            token::SyncNative {
+                account: ctx.accounts.pool_wsol_account.to_account_info(),
+            },
+        ),
+    )?;
     Ok(())
 }
 
-/// H-03 FIX: Validates that the PumpSwap vault token accounts correspond to the expected mints
-/// AND validates that vaults are owned by the PumpSwap pool (prevents account substitution attacks).
-fn validate_pumpswap_vault_mints<'info>(ctx: &Context<ExecuteProposal<'info>>) -> Result<()> {
-    // Validate mints
-    require!(
-        ctx.accounts.pumpswap_pool_base_vault.mint == ctx.accounts.ctop_mint.key(),
-        CtoError::InvalidPumpSwapVaultMints
-    );
-    require!(
-        ctx.accounts.pumpswap_pool_quote_vault.mint == ctx.accounts.wsol_mint.key(),
-        CtoError::InvalidPumpSwapVaultMints
-    );
-    
-    // H-03 FIX: Validate that vaults are owned by the PumpSwap pool
-    // This prevents attacker-controlled token accounts from being passed
-    require!(
-        ctx.accounts.pumpswap_pool_base_vault.owner == ctx.accounts.pumpswap_pool.key(),
-        CtoError::InvalidPumpSwapVaultOwner
-    );
-    require!(
-        ctx.accounts.pumpswap_pool_quote_vault.owner == ctx.accounts.pumpswap_pool.key(),
-        CtoError::InvalidPumpSwapVaultOwner
-    );
-    
-    Ok(())
-}
-
-/// Computes a conservative min-out using constant product math from vault balances.
-///
-/// NOTE:
-/// - This assumes an x*y=k style pool.
-/// - If PumpSwap charges fees, real output will be lower; we already apply a slippage haircut.
-fn compute_min_out_cpmm_from_vaults(
-    quote_reserve: u64,
-    base_reserve: u64,
-    quote_in: u64,
-    slippage_bps: u64,
-) -> Result<u64> {
-    require!(quote_reserve > 0 && base_reserve > 0, CtoError::PumpSwapMathError);
-    require!(quote_in > 0, CtoError::ZeroAmount);
-
-    // x = quote reserve (WSOL), y = base reserve (CTOP)
-    let x = quote_reserve as u128;
-    let y = base_reserve as u128;
-    let dx = quote_in as u128;
-
-    // y_out = y - (k / (x + dx))
-    let k = x.checked_mul(y).ok_or(CtoError::MathOverflow)?;
-    let denom = x.checked_add(dx).ok_or(CtoError::MathOverflow)?;
-    let y_after = k.checked_div(denom).ok_or(CtoError::MathOverflow)?;
-    let expected_out = y.checked_sub(y_after).ok_or(CtoError::PumpSwapMathError)?;
-
-    // Apply a conservative fee haircut first (estimated PumpSwap fee), then slippage haircut.
-    let fee = (BPS_DENOM as u128)
-        .checked_sub(PUMPSWAP_FEE_BPS_ESTIMATE as u128)
-        .ok_or(CtoError::MathOverflow)?;
-    let after_fee = expected_out
-        .checked_mul(fee)
-        .ok_or(CtoError::MathOverflow)?
-        .checked_div(BPS_DENOM as u128)
-        .ok_or(CtoError::MathOverflow)?;
-
-    let slip = (BPS_DENOM as u128)
-        .checked_sub(slippage_bps as u128)
-        .ok_or(CtoError::MathOverflow)?;
-    let min_out = after_fee
-        .checked_mul(slip)
-        .ok_or(CtoError::MathOverflow)?
-        .checked_div(BPS_DENOM as u128)
-        .ok_or(CtoError::MathOverflow)?;
-
-    let min_out_u64 = u64::try_from(min_out).map_err(|_| CtoError::MathOverflow)?;
-    require!(min_out_u64 > 0, CtoError::PumpSwapMinOutZero);
-    Ok(min_out_u64)
-}
-
-/// Heuristic minimum out calculator for legacy Raydium path.
-/// This is intentionally permissive and should not be relied on for robust frontrun protection.
-fn calculate_minimum_amount_out_heuristic(amount_in: u64, slippage_bps: u64) -> Result<u64> {
+/// Calculates the minimum amount out for a swap based on slippage tolerance.
+fn calculate_minimum_amount_out(amount_in: u64, slippage_bps: u64) -> Result<u64> {
     let min_out = (amount_in as u128)
-        .checked_mul(
-            (BPS_DENOM as u128)
-                .checked_sub(slippage_bps as u128)
-                .ok_or(CtoError::MathOverflow)?,
-        )
+        .checked_mul((10_000u128).checked_sub(slippage_bps as u128).ok_or(CtoError::MathOverflow)?)
         .ok_or(CtoError::MathOverflow)?
-        .checked_div(BPS_DENOM as u128)
+        .checked_div(10_000)
+        .ok_or(CtoError::MathOverflow)?;
+
+    // This is a *placeholder* heuristic. For production you should compute min_out using on-chain
+    // pool state (vault balances) to avoid accidental near-zero output.
+    let min_out = min_out
+        .checked_div(100)
         .ok_or(CtoError::MathOverflow)?;
 
     let min_out = u64::try_from(min_out).map_err(|_| CtoError::MathOverflow)?;
     Ok(min_out.max(1))
 }
 
-/// Performs PumpSwap `buy`:
-/// - Spends up to `max_quote_amount_in` WSOL from `pool_wsol_account`
-/// - Receives at least `base_amount_out` CTOP into `pool_ctop_account`
-fn perform_pumpswap_buy<'info>(
-    ctx: &mut Context<ExecuteProposal<'info>>,
-    base_amount_out: u64,
-    max_quote_amount_in: u64,
-    pool_bump: u8,
-) -> Result<()> {
-    let mut data = Vec::with_capacity(8 + 8 + 8);
-    data.extend_from_slice(&PUMPSWAP_BUY_DISCRIMINATOR);
-    data.extend_from_slice(&base_amount_out.to_le_bytes());
-    data.extend_from_slice(&max_quote_amount_in.to_le_bytes());
-
-    // Account order is strict. Do NOT reorder without checking the PumpSwap interface/IDL.
-    let metas = vec![
-        AccountMeta::new(ctx.accounts.pumpswap_pool.key(), false),
-        AccountMeta::new(ctx.accounts.pool.key(), true), // user (signer): pool PDA
-        AccountMeta::new_readonly(ctx.accounts.pumpswap_global_config.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.ctop_mint.key(), false), // base_mint
-        AccountMeta::new_readonly(ctx.accounts.wsol_mint.key(), false), // quote_mint
-        AccountMeta::new(ctx.accounts.pool_ctop_account.key(), false),  // user_base_token_account
-        AccountMeta::new(ctx.accounts.pool_wsol_account.key(), false),  // user_quote_token_account
-        AccountMeta::new(ctx.accounts.pumpswap_pool_base_vault.key(), false),
-        AccountMeta::new(ctx.accounts.pumpswap_pool_quote_vault.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.pumpswap_protocol_fee_recipient.key(), false),
-        AccountMeta::new(ctx.accounts.pumpswap_protocol_fee_recipient_token_account.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.pumpswap_base_token_program.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.pumpswap_quote_token_program.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.associated_token_program.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.pumpswap_event_authority.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.pumpswap_program.key(), false),
-    ];
-
-    let ix = Instruction {
-        program_id: ctx.accounts.pumpswap_program.key(),
-        accounts: metas,
-        data,
-    };
-
-    invoke_signed(
-        &ix,
-        &[
-            ctx.accounts.pumpswap_pool.to_account_info(),
-            ctx.accounts.pool.to_account_info(),
-            ctx.accounts.pumpswap_global_config.to_account_info(),
-            ctx.accounts.ctop_mint.to_account_info(),
-            ctx.accounts.wsol_mint.to_account_info(),
-            ctx.accounts.pool_ctop_account.to_account_info(),
-            ctx.accounts.pool_wsol_account.to_account_info(),
-            ctx.accounts.pumpswap_pool_base_vault.to_account_info(),
-            ctx.accounts.pumpswap_pool_quote_vault.to_account_info(),
-            ctx.accounts.pumpswap_protocol_fee_recipient.to_account_info(),
-            ctx.accounts.pumpswap_protocol_fee_recipient_token_account.to_account_info(),
-            ctx.accounts.pumpswap_base_token_program.to_account_info(),
-            ctx.accounts.pumpswap_quote_token_program.to_account_info(),
-            ctx.accounts.system_program.to_account_info(),
-            ctx.accounts.associated_token_program.to_account_info(),
-            ctx.accounts.pumpswap_event_authority.to_account_info(),
-            ctx.accounts.pumpswap_program.to_account_info(),
-        ],
-        pool_seeds!(&ctx.accounts.pool, pool_bump),
-    )
-    .map_err(|_| CtoError::SwapFailed.into())
-}
-
-/// Performs the Raydium swap from WSOL to CTOP (legacy).
+/// Performs the Raydium swap from WSOL to CTOP.
 fn perform_raydium_swap<'info>(
     ctx: &mut Context<ExecuteProposal<'info>>,
     amount_in: u64,
@@ -1637,27 +1012,29 @@ fn perform_raydium_swap<'info>(
     data.extend_from_slice(&minimum_amount_out.to_le_bytes());
 
     let metas = vec![
-        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-        AccountMeta::new(ctx.accounts.raydium_pool.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.raydium_pool_authority.key(), false),
-        AccountMeta::new(ctx.accounts.raydium_open_orders.key(), false),
-        AccountMeta::new(ctx.accounts.raydium_target_orders.key(), false),
-        AccountMeta::new(ctx.accounts.raydium_coin_vault.key(), false),
-        AccountMeta::new(ctx.accounts.raydium_pc_vault.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.serum_program.key(), false),
-        AccountMeta::new(ctx.accounts.serum_market.key(), false),
-        AccountMeta::new(ctx.accounts.serum_bids.key(), false),
-        AccountMeta::new(ctx.accounts.serum_asks.key(), false),
-        AccountMeta::new(ctx.accounts.serum_event_queue.key(), false),
-        AccountMeta::new(ctx.accounts.serum_coin_vault.key(), false),
-        AccountMeta::new(ctx.accounts.serum_pc_vault.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.serum_vault_signer.key(), false),
-        AccountMeta::new(ctx.accounts.pool_wsol_account.key(), false),
-        AccountMeta::new(ctx.accounts.pool_ctop_account.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.pool.key(), true),
+        // NOTE: Raydium expects a strict account order; these accounts are passed by the client.
+        // This implementation mirrors your V1 pattern.
+        anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.raydium_pool.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.raydium_pool_authority.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.raydium_open_orders.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.raydium_target_orders.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.raydium_coin_vault.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.raydium_pc_vault.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.serum_program.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.serum_market.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.serum_bids.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.serum_asks.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.serum_event_queue.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.serum_coin_vault.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.serum_pc_vault.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.serum_vault_signer.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.pool_wsol_account.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.pool_ctop_account.key(), false),
+        anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.pool.key(), true),
     ];
 
-    let ix = Instruction {
+    let ix = anchor_lang::solana_program::instruction::Instruction {
         program_id: ctx.accounts.raydium_program.key(),
         accounts: metas,
         data,
@@ -1690,16 +1067,11 @@ fn perform_raydium_swap<'info>(
     .map_err(|_| CtoError::SwapFailed.into())
 }
 
-/// M-07 FIX: Transfers CTOP tokens to the incinerator address for burning.
-/// Handles zero balance gracefully (returns 0 instead of error).
+/// Transfers CTOP tokens to the incinerator address for burning.
 fn transfer_to_incinerator<'info>(ctx: &mut Context<ExecuteProposal<'info>>, pool_bump: u8) -> Result<u64> {
     ctx.accounts.pool_ctop_account.reload()?;
     let bal = ctx.accounts.pool_ctop_account.amount;
-    
-    // M-07 FIX: Handle zero balance gracefully (not an error)
-    if bal == 0 {
-        return Ok(0);
-    }
+    require!(bal > 0, CtoError::NoTokensToBurn);
 
     token::transfer(
         CpiContext::new_with_signer(
@@ -1719,6 +1091,8 @@ fn transfer_to_incinerator<'info>(ctx: &mut Context<ExecuteProposal<'info>>, poo
 
 // ===== Recovery helpers =====
 
+/// Transfers SPL tokens from the pool's token account to a destination account.
+/// Uses pre-computed seeds to avoid borrow checker issues.
 fn transfer_spl_from_pool_with_seeds<'info>(
     pool: &AccountInfo<'info>,
     from: &Account<'info, TokenAccount>,
@@ -1752,6 +1126,8 @@ fn verify_inline_sender(
     _mint: Pubkey,
     _amount: u64,
 ) -> Result<bool> {
+    // Intentionally conservative: return false by default.
+    // If you want this, implement using `solana_program::sysvar::instructions` parsing.
     Ok(false)
 }
 
@@ -1774,18 +1150,6 @@ pub struct CreatePool<'info> {
     pub creator: Signer<'info>,
 
     pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct ConfigurePumpSwapPool<'info> {
-    #[account(
-        mut,
-        seeds = [b"pool", pool.token_mint.as_ref()],
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-
-    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -1835,12 +1199,15 @@ pub struct DonateSol<'info> {
     #[account(mut)]
     pub reserve_stake: UncheckedAccount<'info>,
 
+    /// Stake pool manager fee token account (for LST mint)
     #[account(mut)]
     pub manager_fee_account: Account<'info, TokenAccount>,
 
+    /// Referrer pool-token account (can be same as manager_fee_account)
     #[account(mut)]
     pub referrer_pool_tokens_account: Account<'info, TokenAccount>,
 
+    /// Pool's LST token account (owned by pool PDA)
     #[account(
         init_if_needed,
         payer = donor_wallet,
@@ -1849,6 +1216,7 @@ pub struct DonateSol<'info> {
     )]
     pub pool_lst_account: Account<'info, TokenAccount>,
 
+    /// CHECK: LST mint (e.g., jitoSOL) - MUST be mut for CPI to mint tokens
     #[account(mut)]
     pub lst_mint: Account<'info, Mint>,
 
@@ -1897,6 +1265,7 @@ pub struct WithdrawSol<'info> {
     )]
     pub pool_lst_account: Account<'info, TokenAccount>,
 
+    /// CHECK: LST mint (e.g., jitoSOL) - MUST be mut for CPI to burn tokens
     #[account(mut)]
     pub lst_mint: Account<'info, Mint>,
 
@@ -2028,6 +1397,7 @@ pub struct ExecuteProposal<'info> {
     )]
     pub pool_lst_account: Account<'info, TokenAccount>,
 
+    /// CHECK: LST mint (e.g., jitoSOL) - MUST be mut for CPI to burn tokens
     #[account(mut)]
     pub lst_mint: Account<'info, Mint>,
 
@@ -2040,36 +1410,7 @@ pub struct ExecuteProposal<'info> {
 
     pub system_program: Program<'info, System>,
 
-    // ===== PUMPSWAP SWAP ACCOUNTS (CTOP buy & burn, post-graduation) =====
-    /// CHECK
-    pub pumpswap_program: UncheckedAccount<'info>,
-    /// CHECK
-    #[account(mut)]
-    pub pumpswap_pool: UncheckedAccount<'info>,
-
-    /// CHECK
-    pub pumpswap_global_config: UncheckedAccount<'info>,
-    /// CHECK
-    pub pumpswap_protocol_fee_recipient: UncheckedAccount<'info>,
-    /// CHECK
-    #[account(mut)]
-    pub pumpswap_protocol_fee_recipient_token_account: UncheckedAccount<'info>,
-    /// CHECK
-    pub pumpswap_event_authority: UncheckedAccount<'info>,
-
-    /// The pool's base (CTOP) vault token account.
-    #[account(mut)]
-    pub pumpswap_pool_base_vault: Account<'info, TokenAccount>,
-    /// The pool's quote (WSOL) vault token account.
-    #[account(mut)]
-    pub pumpswap_pool_quote_vault: Account<'info, TokenAccount>,
-
-    /// CHECK
-    pub pumpswap_base_token_program: UncheckedAccount<'info>,
-    /// CHECK
-    pub pumpswap_quote_token_program: UncheckedAccount<'info>,
-
-    // ===== RAYDIUM SWAP ACCOUNTS (legacy / optional) =====
+    // ===== RAYDIUM SWAP ACCOUNTS (CTOP buy & burn) =====
     /// CHECK
     pub raydium_program: UncheckedAccount<'info>,
     /// CHECK
@@ -2160,38 +1501,6 @@ pub struct ExecuteProposal<'info> {
     pub executor: Signer<'info>,
 }
 
-#[derive(Accounts)]
-pub struct AbortProposal<'info> {
-    #[account(
-        mut,
-        seeds = [b"pool", pool.token_mint.as_ref()],
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-
-    #[account(mut, has_one = pool)]
-    pub proposal: Account<'info, Proposal>,
-
-    #[account(
-        mut,
-        seeds = [b"donor", pool.key().as_ref(), aborter_wallet.key().as_ref()],
-        bump
-    )]
-    pub aborter: Account<'info, Donor>,
-
-    #[account(mut)]
-    pub aborter_wallet: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"donor", pool.key().as_ref(), proposal.proposer_wallet.as_ref()],
-        bump
-    )]
-    pub proposer_donor: Account<'info, Donor>,
-
-    pub system_program: Program<'info, System>,
-}
-
 // ===== Recovery accounts =====
 
 #[derive(Accounts)]
@@ -2221,9 +1530,11 @@ pub struct RecoverFundsCreate<'info> {
     #[account(mut)]
     pub requester: Signer<'info>,
 
+    /// The token account owned by the pool PDA that holds the accidentally-sent SPL tokens.
     #[account(mut, constraint = pool_token_account.owner == pool.key())]
     pub pool_token_account: Account<'info, TokenAccount>,
 
+    /// Destination token account to receive recovered tokens.
     #[account(mut)]
     pub destination_token_account: Account<'info, TokenAccount>,
 
@@ -2319,10 +1630,6 @@ pub struct Pool {
     pub active_proposal: Option<Pubkey>,
     pub proposal_count: u64,
 
-    // Abort governance cooldown + penalty configuration
-    pub proposal_cooldown_until_ts: i64,
-    pub base_penalty_lamports: u64,
-
     // recovery tracking
     pub active_recovery: Option<Pubkey>,
     pub recovery_count: u64,
@@ -2332,21 +1639,9 @@ pub struct Pool {
     pub stake_pool: Pubkey,
     pub lst_mint: Pubkey,
 
-    // PumpSwap buy&burn (post Pump.fun graduation)
-    pub pumpswap_enabled: bool,
-    pub pumpswap_pool_id: Pubkey,
-    pub pumpswap_base_vault: Pubkey,
-    pub pumpswap_quote_vault: Pubkey,
-    pub pumpswap_global_config: Pubkey,
-    pub pumpswap_fee_recipient: Pubkey,
-    pub pumpswap_version: u8, // H-05 FIX: Track expected PumpSwap version
-
-    // Legacy raydium buy&burn (optional)
+    // raydium buy&burn
     pub raydium_pool_id: Pubkey,
     pub raydium_enabled: bool,
-    
-    // H-04 FIX: Reentrancy guard
-    pub locked: bool,
 }
 
 impl Pool {
@@ -2359,15 +1654,10 @@ impl Pool {
         32 + 32 +      // dev_fee_wallet, burn_token_mint
         1 + 32 +       // active_proposal
         8 +            // proposal_count
-        8 + 8 +        // proposal_cooldown_until_ts, base_penalty_lamports
         1 + 32 +       // active_recovery
         8 +            // recovery_count
         32 + 32 + 32 + // stake_pool_program, stake_pool, lst_mint
-        1 +            // pumpswap_enabled
-        32 + 32 + 32 + 32 + 32 + // pumpswap_pool_id, base_vault, quote_vault, global_config, fee_recipient
-        1 +            // pumpswap_version (H-05 FIX)
-        32 + 1 +       // raydium_pool_id, raydium_enabled
-        1;             // locked (H-04 FIX: reentrancy guard)
+        32 + 1;        // raydium_pool_id, raydium_enabled
 }
 
 #[account]
@@ -2377,16 +1667,10 @@ pub struct Donor {
     pub shares: u64,
     pub total_deposited_lamports: u64,
     pub last_shares_change_slot: u64,
-
-    // Abort/proposer penalty tracking (uncapped exponential fees)
-    pub abort_strike_count: u16,
-    pub propose_strike_count: u16,
-    pub non_abort_participation_count: u16,
-    pub non_propose_participation_count: u16,
 }
 
 impl Donor {
-    pub const SIZE: usize = 32 + 32 + 8 + 8 + 8 + 2 + 2 + 2 + 2;
+    pub const SIZE: usize = 32 + 32 + 8 + 8 + 8;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
@@ -2394,7 +1678,6 @@ pub enum ProposalStatus {
     Active,
     Failed,
     Executed,
-    Aborted,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Copy, Clone, PartialEq, Eq)]
@@ -2406,8 +1689,6 @@ pub enum ProposalKind {
 pub struct Proposal {
     pub pool: Pubkey,
     pub kind: ProposalKind,
-
-    pub proposer_wallet: Pubkey,
 
     pub requested_lamports: u64,
     pub destination_wallet: Pubkey,
@@ -2429,30 +1710,25 @@ pub struct Proposal {
     pub abstain_weight: u64,
     pub participation_weight: u64,
 
-    // Abort voting (weak emergency brake)
-    pub abort_voter_1: Pubkey,
-    pub abort_voter_2: Pubkey,
-    pub abort_count: u8,
-
     pub status: ProposalStatus,
 }
 
 impl Proposal {
+    // Strings are variable; Anchor accounts need max lengths.
+    // Here we cap to 64/256 bytes (UTF-8). Adjust as desired.
     pub const TITLE_MAX: usize = 64;
     pub const DESC_MAX: usize = 256;
 
     pub const SIZE: usize =
-        32 + 1 +              // pool, kind
-        32 +                 // proposer_wallet
-        8 + 32 +              // requested, destination
-        4 + Self::TITLE_MAX + // title
+        32 + 1 +            // pool, kind
+        8 + 32 +            // requested, destination
+        4 + Self::TITLE_MAX + // title (Vec len prefix)
         4 + Self::DESC_MAX +  // description
-        8 + 8 +               // created_at, deadline
-        8 + 8 +               // snapshot_slot, total_snapshot_shares
-        8 +                   // locked_pool_tokens
-        8 + 8 + 8 + 8 +       // yes/no/abstain/participation
-        32 + 32 + 1 +         // abort_voter_1, abort_voter_2, abort_count
-        1;                    // status
+        8 + 8 +             // created_at, deadline
+        8 + 8 +             // snapshot_slot, total_snapshot_shares
+        8 +                 // locked_pool_tokens
+        8 + 8 + 8 + 8 +     // yes/no/abstain/participation
+        1;                  // status
 }
 
 #[account]
@@ -2476,11 +1752,6 @@ pub struct RecoveryProposal {
     pub abstain_weight: u64,
     pub participation_weight: u64,
 
-    // Abort voting (weak emergency brake)
-    pub abort_voter_1: Pubkey,
-    pub abort_voter_2: Pubkey,
-    pub abort_count: u8,
-
     pub status: ProposalStatus,
 }
 
@@ -2503,7 +1774,6 @@ pub enum VoteChoice {
     Yes,
     No,
     Abstain,
-    Abort,
 }
 
 #[account]
@@ -2520,70 +1790,6 @@ impl VoteRecord {
 }
 
 // ============= Events =============
-
-// L-05 FIX: Comprehensive event emissions for state changes
-
-#[event]
-pub struct PoolCreatedEvent {
-    pub pool: Pubkey,
-    pub token_mint: Pubkey,
-    pub authority: Pubkey,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct DonationEvent {
-    pub pool: Pubkey,
-    pub donor: Pubkey,
-    pub lamports_in: u64,
-    pub shares_minted: u64,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct WithdrawalEvent {
-    pub pool: Pubkey,
-    pub donor: Pubkey,
-    pub lamports_out: u64,
-    pub shares_burned: u64,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct ProposalCreatedEvent {
-    pub pool: Pubkey,
-    pub proposal: Pubkey,
-    pub proposer: Pubkey,
-    pub requested_lamports: u64,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct VoteCastEvent {
-    pub pool: Pubkey,
-    pub proposal: Pubkey,
-    pub voter: Pubkey,
-    pub choice: VoteChoice,
-    pub weight: u64,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct ProposalExecutedEvent {
-    pub pool: Pubkey,
-    pub proposal: Pubkey,
-    pub lamports_paid: u64,
-    pub protocol_fee: u64,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct ProposalAbortedEvent {
-    pub pool: Pubkey,
-    pub proposal: Pubkey,
-    pub abort_voters: [Pubkey; 2],
-    pub timestamp: i64,
-}
 
 #[event]
 pub struct TokenBurnEvent {
@@ -2643,7 +1849,7 @@ pub enum CtoError {
     SharesTooRecent,
     #[msg("Unauthorized")]
     UnauthorizedAuthority,
-    #[msg("Swap failed")]
+    #[msg("Raydium swap failed")]
     SwapFailed,
     #[msg("No tokens to burn")]
     NoTokensToBurn,
@@ -2665,42 +1871,4 @@ pub enum CtoError {
     SingleDonorCannotPropose,
     #[msg("Recovery not allowed for the configured LST")]
     RecoveryNotAllowedForLST,
-    #[msg("Title too long")]
-    TitleTooLong,
-    #[msg("Description too long")]
-    DescriptionTooLong,
-    #[msg("Proposal cooldown is active")]
-    ProposalCooldownActive,
-    #[msg("Abort not eligible")]
-    AbortNotEligible,
-
-    // PumpSwap-specific
-    #[msg("Invalid PumpSwap config")]
-    InvalidPumpSwapConfig,
-    #[msg("Invalid PumpSwap vault mints")]
-    InvalidPumpSwapVaultMints,
-    #[msg("Invalid PumpSwap vault owner")]
-    InvalidPumpSwapVaultOwner,
-    #[msg("PumpSwap math error")]
-    PumpSwapMathError,
-    #[msg("PumpSwap min-out computed to zero")]
-    PumpSwapMinOutZero,
-    #[msg("PumpSwap version mismatch - upgrade required")]
-    PumpSwapVersionMismatch,
-
-    // H-04 FIX: Reentrancy guard error
-    #[msg("Reentrancy detected")]
-    ReentrancyDetected,
-
-    // Abort-related
-    #[msg("Too early to execute (minimum review delay not met)")]
-    TooEarlyToExecuteMinDelay,
-    #[msg("Abort threshold not met (need 2 voters)")]
-    AbortThresholdNotMet,
-    #[msg("Abort review period not met")]
-    AbortTooEarly,
-    #[msg("Abort voter slots full")]
-    AbortVoterSlotsFull,
-    #[msg("Abort not allowed on recovery proposals")]
-    AbortNotAllowedOnRecovery,
 }
