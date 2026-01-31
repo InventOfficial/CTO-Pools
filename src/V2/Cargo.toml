@@ -1,0 +1,32 @@
+[package]
+name = "cto_pools"
+version = "0.2.0"
+description = "CTO Pools V2 - Fully staked governance treasury using LST (jitoSOL) via SPL Stake Pool CPI"
+edition = "2021"
+license = "MIT"
+homepage = "https://github.com/InventOfficial/CTO-Pools"
+repository = "https://github.com/InventOfficial/CTO-Pools"
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "cto_pools"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.32.1", features = ["init-if-needed", "event-cpi"] }
+anchor-spl  = "0.32.1"
+
+# SPL Stake Pool client (SOL <-> LST deposit/withdraw instruction builders + state parsing)
+# Use no-entrypoint for on-chain program builds.
+spl-stake-pool = { version = "2.0.3", features = ["no-entrypoint"] }
+
+# borsh v1 for deserializing StakePool state (spl-stake-pool uses borsh 1.x, anchor uses 0.10.x)
+borsh1 = { package = "borsh", version = "1" }
